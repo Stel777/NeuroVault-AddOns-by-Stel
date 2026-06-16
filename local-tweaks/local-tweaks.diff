@@ -1,0 +1,181 @@
+diff --git a/.claude/skills/update-brain/SKILL.md b/.claude/skills/update-brain/SKILL.md
+index c1734e4..2fd8c97 100644
+--- a/.claude/skills/update-brain/SKILL.md
++++ b/.claude/skills/update-brain/SKILL.md
+@@ -209,6 +209,29 @@ python scripts/thesis_incremental_refresh.py
+ The scanner still reports thesis staleness (its source is hard-coded in scan.py),
+ but route the actual refresh through the thesis script so the docx conversion runs.
+ 
++## Multi-source brains (one brain fed from several folders)
++
++A few brains are intentionally fed from **more than one source folder** (the same
++project living in two places). The importer writes each source into its own
++`_source_files\<folder name>` subfolder, so multiple sources **coexist** in one
++brain without clobbering. BUT the importer rewrites the single `Source:` line in
++`00_PROJECT_IMPORT_OVERVIEW.md` on every run, so the scanner would otherwise only
++"remember" the last-imported folder — and mis-flag the others as never-imported.
++
++These brains are registered in `scan.py`'s `MULTI_SOURCE` map (the authoritative
++list of which folders feed which brain). To refresh one, run the importer **once
++per listed source**, all with the same `--brain-id`:
++
++```bash
++python scripts/import_project_vault.py --source "<folder A>" --brain-id <id> --name "<Name>"
++python scripts/import_project_vault.py --source "<folder B>" --brain-id <id> --name "<Name>"
++```
++
++Current multi-source brains:
++- **`makeup-game`** ← both `C:\Users\steli\Documents\Claude_Projects\Makeup Game`
++  **and** `C:\Users\steli\Documents\Codex_GPT\Makeup Game - Codex` (same project, two
++  working folders; the user will eventually merge them — keep both indexed until then).
++
+ ## Notes & gotchas
+ 
+ - **Incremental + safe to re-run.** The importer hashes files; an up-to-date
+diff --git a/.claude/skills/update-brain/scan.py b/.claude/skills/update-brain/scan.py
+index 6c345ac..078b2c2 100644
+--- a/.claude/skills/update-brain/scan.py
++++ b/.claude/skills/update-brain/scan.py
+@@ -67,6 +67,22 @@ SPECIAL_SOURCES = {
+     "thesis": r"C:\Users\steli\Desktop\PwC\uni (thesis)",
+ }
+ 
++# Brains intentionally fed from MORE THAN ONE source folder. The standard import
++# overwrites a brain's single recorded "Source:" line on every run, so a brain
++# that is fed from several folders would otherwise "forget" all but the last one
++# (and the forgotten folders get mis-flagged as never-imported). List every
++# source for such a brain here so staleness + discovery stay correct.
++# When you `update-brain` one of these, run the importer once PER listed source
++# (same --brain-id), e.g.:
++#   import_project_vault.py --source "<A>" --brain-id makeup-game --name "Makeup Game"
++#   import_project_vault.py --source "<B>" --brain-id makeup-game --name "Makeup Game"
++MULTI_SOURCE = {
++    "makeup-game": [
++        r"C:\Users\steli\Documents\Claude_Projects\Makeup Game",
++        r"C:\Users\steli\Documents\Codex_GPT\Makeup Game - Codex",
++    ],
++}
++
+ # When scanning a project root for NEVER-imported folders, ignore noise:
+ # dotfolders, scratch folders (#...), and the NeuroVault app repo + its
+ # legacy/backup/test clones (those are the app, not a project to index).
+@@ -130,6 +146,16 @@ def brain_source(nv_home: Path, brain_id: str) -> str | None:
+     return None
+ 
+ 
++def brain_sources(nv_home: Path, brain_id: str) -> list[str]:
++    """Every source folder feeding a brain. Most have exactly one (read from the
++    import overview). Brains in MULTI_SOURCE are fed from several folders, which
++    the overview can't record (last import wins) -- the full list lives there."""
++    if brain_id in MULTI_SOURCE:
++        return list(MULTI_SOURCE[brain_id])
++    src = brain_source(nv_home, brain_id)
++    return [src] if src else []
++
++
+ def dest_for(nv_home: Path, brain_id: str, source: str) -> Path:
+     """Where the source is mirrored inside the brain vault."""
+     return nv_home / "brains" / brain_id / "vault" / "_source_files" / Path(source).name
+@@ -169,19 +195,22 @@ def main() -> int:
+     nv_home = Path(args.nv_home)
+     brains = load_brains(nv_home)
+ 
+-    # brain_id -> {name, source, dest}
++    # brain_id -> {name, source, dest, sources:[{source,dest}]}
+     mapped: dict[str, dict] = {}
+     source_index: dict[str, str] = {}  # norm(source) -> brain_id
+     for b in brains:
+         bid = b.get("id", "")
+         if bid in NON_PROJECT_BRAINS:
+             continue
+-        src = brain_source(nv_home, bid)
+-        if not src:
++        srcs = brain_sources(nv_home, bid)
++        if not srcs:
+             continue
+-        mapped[bid] = {"name": b.get("name", bid), "source": src,
+-                       "dest": str(dest_for(nv_home, bid, src))}
+-        source_index[norm(src)] = bid
++        sources = [{"source": s, "dest": str(dest_for(nv_home, bid, s))} for s in srcs]
++        mapped[bid] = {"name": b.get("name", bid),
++                       "source": sources[0]["source"], "dest": sources[0]["dest"],
++                       "sources": sources}
++        for s in srcs:
++            source_index[norm(s)] = bid
+ 
+     result: dict = {"mode": None, "brains": [], "unimported": [], "single": None}
+ 
+@@ -192,14 +221,20 @@ def main() -> int:
+         bid = source_index.get(norm(src))
+         print(f"# Single project: {src}\n")
+         if bid:
+-            st = staleness(src, Path(mapped[bid]["dest"]))
++            dest = dest_for(nv_home, bid, src)
++            st = staleness(src, dest)
+             print(f"Already imported as brain '{bid}' ({mapped[bid]['name']}).")
++            if len(mapped[bid]["sources"]) > 1:
++                print(f"  (note: '{bid}' is fed from {len(mapped[bid]['sources'])} source folders; "
++                      f"this report is for the one queried above)")
+             print(f"  new files:     {st['new']}")
+             print(f"  changed files: {st['changed']}")
+             print(f"  total scanned: {st['total']}")
+             verdict = "UP TO DATE" if st["new"] == 0 and st["changed"] == 0 else "STALE -> refresh recommended"
+             print(f"  verdict: {verdict}")
+-            result["single"] = {"brain_id": bid, **mapped[bid], "staleness": st, "imported": True}
++            result["single"] = {"brain_id": bid, "name": mapped[bid]["name"],
++                                 "source": src, "dest": str(dest),
++                                 "staleness": st, "imported": True}
+         else:
+             print("NOT imported into any brain yet -> would create a NEW brain.")
+             result["single"] = {"brain_id": None, "source": src, "imported": False}
+@@ -210,12 +245,26 @@ def main() -> int:
+     result["mode"] = "full"
+     print("# Brains mapped to a source folder\n")
+     for bid, info in sorted(mapped.items()):
+-        st = staleness(info["source"], Path(info["dest"]))
+-        flag = ("MISSING SRC" if st["source_missing"]
+-                else "up to date" if st["new"] == 0 and st["changed"] == 0
+-                else f"STALE (+{st['new']} new, ~{st['changed']} changed)")
+-        print(f"  {bid:<40} {flag}")
+-        result["brains"].append({"brain_id": bid, **info, "staleness": st})
++        per_source = []
++        agg_new = agg_changed = agg_total = 0
++        any_missing = False
++        for sd in info["sources"]:
++            st = staleness(sd["source"], Path(sd["dest"]))
++            per_source.append({**sd, "staleness": st})
++            any_missing = any_missing or st["source_missing"]
++            agg_new += st["new"]
++            agg_changed += st["changed"]
++            agg_total += st["total"]
++        agg = {"source_missing": any_missing, "new": agg_new,
++               "changed": agg_changed, "total": agg_total}
++        flag = ("MISSING SRC" if any_missing and agg_total == 0
++                else "up to date" if agg_new == 0 and agg_changed == 0
++                else f"STALE (+{agg_new} new, ~{agg_changed} changed)")
++        suffix = f"  [{len(info['sources'])} sources]" if len(info["sources"]) > 1 else ""
++        print(f"  {bid:<40} {flag}{suffix}")
++        result["brains"].append({"brain_id": bid, "name": info["name"],
++                                 "source": info["source"], "dest": info["dest"],
++                                 "sources": per_source, "staleness": agg})
+ 
+     # Never-imported projects under the given roots.
+     if args.roots:
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index db6f653..20d950a 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -34,11 +34,13 @@ pub struct NoteMeta {
+ /// helper still finds the vault so the UI isn't empty.
+ fn nv_home() -> PathBuf {
+     if let Ok(explicit) = std::env::var("NEUROVAULT_HOME") {
++        let explicit = explicit.trim().to_string();
+         if !explicit.is_empty() {
+             return PathBuf::from(explicit);
+         }
+     }
+     if let Ok(legacy) = std::env::var("ENGRAM_HOME") {
++        let legacy = legacy.trim().to_string();
+         if !legacy.is_empty() {
+             return PathBuf::from(legacy);
+         }

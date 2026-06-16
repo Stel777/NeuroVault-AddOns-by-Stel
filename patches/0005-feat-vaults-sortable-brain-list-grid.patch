@@ -1,0 +1,286 @@
+From 4905ac1eefffd9bf1ffbae6a8ca566d18bb1ee8a Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Fri, 12 Jun 2026 22:30:29 +0300
+Subject: [PATCH 05/11] feat(vaults): sortable brain list/grid
+
+Add a sort control to the BrainSelector header (both list and grid views):
+Name (A-Z), Date added, Recently changed, Most notes. Choice persists to
+localStorage like the view toggle.
+
+Backend: add last_modified_secs to BrainStats, computed free in the existing
+vault walk (newest .md mtime), powering the Recently changed sort.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src-tauri/src/memory/read_ops.rs |  30 ++++++---
+ src/components/BrainSelector.tsx | 110 +++++++++++++++++++++++++++++--
+ 2 files changed, 128 insertions(+), 12 deletions(-)
+
+diff --git a/src-tauri/src/memory/read_ops.rs b/src-tauri/src/memory/read_ops.rs
+index 8ea7abc..115fd04 100644
+--- a/src-tauri/src/memory/read_ops.rs
++++ b/src-tauri/src/memory/read_ops.rs
+@@ -90,6 +90,10 @@ pub struct BrainStats {
+     pub total_bytes: u64,
+     pub vault_path: String,
+     pub is_external: bool,
++    /// Unix seconds of the most-recently-modified markdown file in the vault
++    /// (0 if empty). Lets the UI sort brains by "recently changed".
++    #[serde(default)]
++    pub last_modified_secs: u64,
+ }
+ 
+ /// Brain registry entry enriched with disk footprint — superset of the
+@@ -384,10 +388,10 @@ pub fn brain_stats(brain_id: &str) -> Result<BrainStats> {
+         None => (root.join("vault"), false),
+     };
+ 
+-    let (note_count, markdown_bytes) = if vault.exists() {
++    let (note_count, markdown_bytes, last_modified_secs) = if vault.exists() {
+         count_markdown(&vault)
+     } else {
+-        (0, 0)
++        (0, 0, 0)
+     };
+ 
+     let mut db_bytes: u64 = 0;
+@@ -406,33 +410,42 @@ pub fn brain_stats(brain_id: &str) -> Result<BrainStats> {
+         total_bytes: markdown_bytes + db_bytes,
+         vault_path: vault.to_string_lossy().to_string(),
+         is_external,
++        last_modified_secs,
+     })
+ }
+ 
+-/// Recursively count markdown files + byte total under `root`. Silently
+-/// skips entries we can't stat — matches Python's `OSError` swallow.
+-fn count_markdown(root: &Path) -> (i64, u64) {
++/// Recursively count markdown files + byte total under `root`, plus the
++/// newest mtime seen (unix secs). Silently skips entries we can't stat —
++/// matches Python's `OSError` swallow.
++fn count_markdown(root: &Path) -> (i64, u64, u64) {
+     let mut count: i64 = 0;
+     let mut bytes: u64 = 0;
++    let mut newest: u64 = 0;
+     let Ok(entries) = fs::read_dir(root) else {
+-        return (0, 0);
++        return (0, 0, 0);
+     };
+     for entry in entries.flatten() {
+         let path = entry.path();
+         if path.is_dir() {
+-            let (c, b) = count_markdown(&path);
++            let (c, b, m) = count_markdown(&path);
+             count += c;
+             bytes += b;
++            newest = newest.max(m);
+             continue;
+         }
+         if path.extension().map_or(false, |e| e == "md") {
+             if let Ok(meta) = fs::metadata(&path) {
+                 bytes += meta.len();
+                 count += 1;
++                if let Ok(modified) = meta.modified() {
++                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
++                        newest = newest.max(dur.as_secs());
++                    }
++                }
+             }
+         }
+     }
+-    (count, bytes)
++    (count, bytes, newest)
+ }
+ 
+ /// Equivalent of `GET /api/brains` — every brain in `brains.json`
+@@ -452,6 +465,7 @@ pub fn list_brains_with_stats() -> Result<Vec<BrainSummary>> {
+             total_bytes: 0,
+             vault_path: vault_path.clone().unwrap_or_default(),
+             is_external: vault_path.is_some(),
++            last_modified_secs: 0,
+         });
+         out.push(BrainSummary {
+             id,
+diff --git a/src/components/BrainSelector.tsx b/src/components/BrainSelector.tsx
+index 55b3e42..e55177b 100644
+--- a/src/components/BrainSelector.tsx
++++ b/src/components/BrainSelector.tsx
+@@ -1,11 +1,20 @@
+-import { useState, useRef, useEffect, type CSSProperties } from "react";
++import { useState, useRef, useEffect, useMemo, type CSSProperties } from "react";
+ import { createPortal } from "react-dom";
+ import { useBrainStore } from "../stores/brainStore";
+ import { API_HOST } from "../lib/config";
+ 
+ const API = API_HOST;
+ 
+-interface BrainStats { note_count: number; total_bytes: number }
++interface BrainStats { note_count: number; total_bytes: number; last_modified_secs: number }
++
++// Sort options for the vault list/grid. `key` is persisted to localStorage.
++const SORT_OPTIONS = [
++  { key: "name", label: "Name (A–Z)" },
++  { key: "created", label: "Date added" },
++  { key: "modified", label: "Recently changed" },
++  { key: "notes", label: "Most notes" },
++] as const;
++type SortKey = (typeof SORT_OPTIONS)[number]["key"];
+ 
+ const PORTAL_THEME_VARS = [
+   "--nv-bg",
+@@ -37,6 +46,15 @@ export function BrainSelector() {
+       return "list";
+     }
+   });
++  const [sortKey, setSortKey] = useState<SortKey>(() => {
++    try {
++      const v = localStorage.getItem("neurovault.brainSelector.sort");
++      return SORT_OPTIONS.some((o) => o.key === v) ? (v as SortKey) : "name";
++    } catch {
++      return "name";
++    }
++  });
++  const [sortMenuOpen, setSortMenuOpen] = useState(false);
+   const [creating, setCreating] = useState(false);
+   const [newName, setNewName] = useState("");
+   const [newDesc, setNewDesc] = useState("");
+@@ -57,6 +75,32 @@ export function BrainSelector() {
+     try { localStorage.setItem("neurovault.brainSelector.view", viewMode); } catch { /* ignore */ }
+   }, [viewMode]);
+ 
++  useEffect(() => {
++    try { localStorage.setItem("neurovault.brainSelector.sort", sortKey); } catch { /* ignore */ }
++  }, [sortKey]);
++
++  // Sorted view of the brains. `name`/`created` use fields present immediately;
++  // `modified`/`notes` read per-brain stats (fetched on open) and re-sort once
++  // those arrive. The active brain is not pinned — pure sort by the chosen key.
++  const sortedBrains = useMemo(() => {
++    const arr = [...brains];
++    arr.sort((a, b) => {
++      switch (sortKey) {
++        case "name":
++          return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
++        case "created":
++          return (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0);
++        case "modified":
++          return (stats[b.id]?.last_modified_secs ?? 0) - (stats[a.id]?.last_modified_secs ?? 0);
++        case "notes":
++          return (stats[b.id]?.note_count ?? 0) - (stats[a.id]?.note_count ?? 0);
++        default:
++          return 0;
++      }
++    });
++    return arr;
++  }, [brains, sortKey, stats]);
++
+   useEffect(() => {
+     if (!open || !triggerRef.current) return;
+     const computed = getComputedStyle(triggerRef.current);
+@@ -103,7 +147,11 @@ export function BrainSelector() {
+           if (!r.ok) return;
+           const s = await r.json();
+           if (s && typeof s.note_count === "number") {
+-            next[b.id] = { note_count: s.note_count, total_bytes: s.total_bytes };
++            next[b.id] = {
++              note_count: s.note_count,
++              total_bytes: s.total_bytes,
++              last_modified_secs: s.last_modified_secs ?? 0,
++            };
+           }
+         } catch { /* server offline — skip */ }
+       }));
+@@ -121,6 +169,7 @@ export function BrainSelector() {
+       if (!insideTrigger && !insidePanel) {
+         setOpen(false);
+         setCreating(false);
++        setSortMenuOpen(false);
+       }
+     };
+     document.addEventListener("mousedown", handler);
+@@ -129,6 +178,7 @@ export function BrainSelector() {
+ 
+   const handleSwitch = async (brainId: string) => {
+     setOpen(false);
++    setSortMenuOpen(false);
+     setViewMode("list");
+     await switchBrain(brainId);
+   };
+@@ -248,6 +298,57 @@ export function BrainSelector() {
+                 {brains.length} total
+               </p>
+             </div>
++            <div className="flex items-center gap-1.5">
++            {/* Sort control — applies to both list and grid views */}
++            <div className="relative">
++              <button
++                onClick={() => setSortMenuOpen((s) => !s)}
++                className="flex items-center gap-1 h-7 px-1.5 rounded-md transition-colors"
++                style={{
++                  color: "var(--nv-text-dim)",
++                  background: sortMenuOpen ? "var(--nv-surface)" : "transparent",
++                }}
++                title="Sort vaults"
++                aria-label="Sort vaults"
++                aria-haspopup="menu"
++                aria-expanded={sortMenuOpen}
++              >
++                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 7h12M3 12h8M3 17h5M17 5v14m0 0l-3-3m3 3l3-3" />
++                </svg>
++                <span className="text-[10px] font-[Geist,sans-serif] hidden sm:inline whitespace-nowrap">
++                  {SORT_OPTIONS.find((o) => o.key === sortKey)?.label}
++                </span>
++              </button>
++              {sortMenuOpen && (
++                <div
++                  role="menu"
++                  className="absolute right-0 top-[30px] z-[90] rounded-md overflow-hidden shadow-xl min-w-[150px]"
++                  style={{ background: "var(--nv-bg)", border: "1px solid var(--nv-border)" }}
++                >
++                  {SORT_OPTIONS.map((opt) => (
++                    <button
++                      key={opt.key}
++                      role="menuitemradio"
++                      aria-checked={sortKey === opt.key}
++                      onClick={() => { setSortKey(opt.key); setSortMenuOpen(false); }}
++                      className="w-full text-left px-2.5 py-1.5 text-[11px] font-[Geist,sans-serif] flex items-center justify-between gap-2 transition-colors"
++                      style={{
++                        color: sortKey === opt.key ? "var(--nv-text)" : "var(--nv-text-muted)",
++                        background: sortKey === opt.key ? "var(--nv-surface)" : "transparent",
++                      }}
++                      onMouseEnter={(e) => { if (sortKey !== opt.key) e.currentTarget.style.background = "var(--nv-surface)"; }}
++                      onMouseLeave={(e) => { if (sortKey !== opt.key) e.currentTarget.style.background = "transparent"; }}
++                    >
++                      {opt.label}
++                      {sortKey === opt.key && (
++                        <span className="text-[10px]" style={{ color: "var(--nv-accent)" }}>✓</span>
++                      )}
++                    </button>
++                  ))}
++                </div>
++              )}
++            </div>
+             <div className="flex items-center gap-0.5 rounded-md p-0.5" style={{ background: "var(--nv-surface)" }}>
+               <button
+                 onClick={() => setViewMode("list")}
+@@ -296,6 +397,7 @@ export function BrainSelector() {
+                 </button>
+               )}
+             </div>
++            </div>
+           </div>
+ 
+           {/* Vault list */}
+@@ -303,7 +405,7 @@ export function BrainSelector() {
+             className={`${isGrid ? "h-[calc(100%-45px)] p-2 grid gap-2 content-start" : "max-h-[280px] py-1"} overflow-y-auto`}
+             style={isGrid ? { gridTemplateColumns: "repeat(5, minmax(0, 1fr))" } : undefined}
+           >
+-            {brains.map((brain) => {
++            {sortedBrains.map((brain) => {
+               const isEditing = editingId === brain.id;
+               const isConfirming = confirmDelete === brain.id;
+               if (isEditing) {
+-- 
+2.53.0.windows.2
+

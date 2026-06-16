@@ -1,0 +1,1415 @@
+From e6824c6e71d9c19be40efc06b23b5655f2e225ad Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Wed, 3 Jun 2026 11:01:12 +0300
+Subject: [PATCH 01/11] chore: preserve local NeuroVault customizations
+
+---
+ Start-NeuroVault-SSD.cmd              |  27 ++
+ scripts/import_project_vault.py       | 534 ++++++++++++++++++++++++++
+ scripts/thesis_incremental_refresh.py | 181 +++++++++
+ src-tauri/src/lib.rs                  |  34 ++
+ src-tauri/src/memory/paths.rs         |  27 +-
+ src/components/BrainSelector.tsx      | 225 ++++++++++-
+ src/components/GraphFilterPanel.tsx   |  49 ++-
+ src/components/NeuralGraph.tsx        |   5 +-
+ src/components/Sidebar.tsx            |   1 +
+ src/stores/graphSettingsStore.ts      |  28 ++
+ 10 files changed, 1086 insertions(+), 25 deletions(-)
+ create mode 100644 Start-NeuroVault-SSD.cmd
+ create mode 100644 scripts/import_project_vault.py
+ create mode 100644 scripts/thesis_incremental_refresh.py
+
+diff --git a/Start-NeuroVault-SSD.cmd b/Start-NeuroVault-SSD.cmd
+new file mode 100644
+index 0000000..ec13063
+--- /dev/null
++++ b/Start-NeuroVault-SSD.cmd
+@@ -0,0 +1,27 @@
++@echo off
++setlocal
++
++set "NEUROVAULT_HOME=D:\NEURO-VAULT-STORAGE\.neurovault"
++set "REPO_DIR=C:\Users\steli\Documents\Claude_Projects\NeuroVault_byDath"
++set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
++
++if not exist "%NEUROVAULT_HOME%\brains.json" (
++  echo NeuroVault SSD home was not found:
++  echo   %NEUROVAULT_HOME%
++  echo.
++  echo Plug in the external SSD first, then run this launcher again.
++  pause
++  exit /b 1
++)
++
++cd /d "%REPO_DIR%" || (
++  echo NeuroVault project folder was not found:
++  echo   %REPO_DIR%
++  pause
++  exit /b 1
++)
++
++echo Starting NeuroVault with SSD brain storage:
++echo   %NEUROVAULT_HOME%
++echo.
++npx.cmd tauri dev
+diff --git a/scripts/import_project_vault.py b/scripts/import_project_vault.py
+new file mode 100644
+index 0000000..dd68f25
+--- /dev/null
++++ b/scripts/import_project_vault.py
+@@ -0,0 +1,534 @@
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import html
++import json
++import mimetypes
++import os
++import re
++import shutil
++import zipfile
++from datetime import datetime, timezone
++from pathlib import Path
++
++
++SKIP_DIRS = {
++    ".claude",
++    ".git",
++    ".hg",
++    ".svn",
++    ".next",
++    ".nuxt",
++    ".turbo",
++    ".vite",
++    ".venv",
++    "__pycache__",
++    "build",
++    "cache",
++    "coverage",
++    "cuda_outputs",
++    "dist",
++    "downloads",
++    "external-repos",
++    "node_modules",
++    "logs",
++    "live_backups",
++    "memory_backups",
++    "models",
++    "outputs",
++    "pip_cache",
++    "release",
++    "target",
++    "uploads",
++    "venv",
++    "venv_cuda",
++    "MegaGym-Website",
++}
++
++SKIP_SUFFIXES = (
++    ".neurovault.md",
++    ".neurovault.html",
++)
++
++SKIP_FILENAMES = {
++    ".env",
++    ".env.local",
++    ".env.development.local",
++    ".env.test.local",
++    ".env.production.local",
++    ".git",
++    ".skill-optimizer-ran",
++    ".cache",
++    ".metadata_cache.json",
++    "bun.lockb",
++    "libraries.json",
++    "package-lock.json",
++    "pnpm-lock.yaml",
++    "transcribepro-macos-buildkit.zip",
++    "transcribepro-windows-installer.zip",
++    "yarn.lock",
++    "youtube_cookies.txt",
++}
++
++SKIP_EXTS = {
++    ".mp4",
++    ".zip",
++}
++
++TEXT_EXTS = {
++    "",
++    ".babelrc",
++    ".css",
++    ".csv",
++    ".cc",
++    ".cmake",
++    ".cpp",
++    ".dart",
++    ".entitlements",
++    ".env",
++    ".gradle",
++    ".gitignore",
++    ".h",
++    ".htm",
++    ".html",
++    ".iml",
++    ".ini",
++    ".java",
++    ".js",
++    ".json",
++    ".jsx",
++    ".kt",
++    ".kts",
++    ".lock",
++    ".log",
++    ".m",
++    ".manifest",
++    ".md",
++    ".mjs",
++    ".pbxproj",
++    ".plist",
++    ".properties",
++    ".ps1",
++    ".py",
++    ".rc",
++    ".sample",
++    ".scss",
++    ".sh",
++    ".storyboard",
++    ".swift",
++    ".svg",
++    ".toml",
++    ".ts",
++    ".tsx",
++    ".txt",
++    ".vue",
++    ".xcconfig",
++    ".xcsettings",
++    ".xcscheme",
++    ".xcworkspacedata",
++    ".xml",
++    ".yaml",
++    ".yml",
++}
++
++LANG_BY_EXT = {
++    ".css": "css",
++    ".csv": "csv",
++    ".cc": "cpp",
++    ".cmake": "cmake",
++    ".cpp": "cpp",
++    ".dart": "dart",
++    ".html": "html",
++    ".htm": "html",
++    ".java": "java",
++    ".js": "javascript",
++    ".jsx": "jsx",
++    ".kt": "kotlin",
++    ".kts": "kotlin",
++    ".m": "objective-c",
++    ".json": "json",
++    ".md": "markdown",
++    ".mjs": "javascript",
++    ".plist": "xml",
++    ".properties": "properties",
++    ".ps1": "powershell",
++    ".py": "python",
++    ".scss": "scss",
++    ".sh": "bash",
++    ".swift": "swift",
++    ".svg": "xml",
++    ".toml": "toml",
++    ".ts": "typescript",
++    ".tsx": "tsx",
++    ".vue": "vue",
++    ".xml": "xml",
++    ".yaml": "yaml",
++    ".yml": "yaml",
++}
++
++
++def slugify(value: str) -> str:
++    slug = re.sub(r"[^A-Za-z0-9]+", "-", value.strip()).strip("-").lower()
++    return slug or "project"
++
++
++def now_utc() -> str:
++    return datetime.now(timezone.utc).isoformat()
++
++
++def read_text_guess(path: Path) -> str:
++    data = path.read_bytes()
++    for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
++        try:
++            return data.decode(enc)
++        except UnicodeDecodeError:
++            continue
++    return data.decode("utf-8", errors="replace")
++
++
++def normalize_newlines(text: str) -> str:
++    text = text.replace("\r\n", "\n").replace("\r", "\n")
++    return re.sub(r"\n{4,}", "\n\n\n", text).strip()
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def yaml_string(value: str) -> str:
++    return json.dumps(value, ensure_ascii=False)
++
++
++def frontmatter(source_rel: str, source_path: Path, digest: str, mode: str) -> str:
++    stat = source_path.stat()
++    return (
++        "---\n"
++        f"source_path: {yaml_string(source_rel)}\n"
++        f"source_sha256: {yaml_string(digest)}\n"
++        f"source_bytes: {stat.st_size}\n"
++        f"source_modified_utc: {yaml_string(datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat())}\n"
++        f"conversion_mode: {yaml_string(mode)}\n"
++        "---\n\n"
++    )
++
++
++def code_markdown(source_rel: str, path: Path, digest: str, text: str) -> str:
++    lang = LANG_BY_EXT.get(path.suffix.lower(), "")
++    fence = "```"
++    while fence in text:
++        fence += "`"
++    return (
++        frontmatter(source_rel, path, digest, "text-code")
++        + f"# Source File: {source_rel}\n\n"
++        + "Original file is preserved beside this generated markdown sidecar.\n\n"
++        + f"Original SHA-256: `{digest}`\n\n"
++        + "## Content\n\n"
++        + f"{fence}{lang}\n{text.rstrip()}\n{fence}\n"
++    )
++
++
++def html_text_markdown(source_rel: str, path: Path, digest: str, text: str) -> str:
++    stripped = re.sub(r"(?is)<(script|style).*?</\1>", "\n", text)
++    stripped = re.sub(r"(?is)<br\s*/?>", "\n", stripped)
++    stripped = re.sub(r"(?is)</(p|div|h[1-6]|li|tr|table)>", "\n", stripped)
++    stripped = re.sub(r"(?is)<[^>]+>", " ", stripped)
++    stripped = normalize_newlines(html.unescape(re.sub(r"[ \t]+", " ", stripped)))
++    return (
++        frontmatter(source_rel, path, digest, "html-text")
++        + f"# HTML File: {source_rel}\n\n"
++        + "Original file is preserved beside this generated markdown sidecar.\n\n"
++        + f"Original SHA-256: `{digest}`\n\n"
++        + "## Extracted Text\n\n"
++        + (stripped or "[No visible text extracted.]")
++        + "\n\n## Raw HTML\n\n"
++        + "```html\n"
++        + text.rstrip()
++        + "\n```\n"
++    )
++
++
++def binary_markdown(source_rel: str, path: Path, digest: str) -> str:
++    mime, _ = mimetypes.guess_type(path.name)
++    return (
++        frontmatter(source_rel, path, digest, "binary-metadata")
++        + f"# Binary Asset: {source_rel}\n\n"
++        + "Original file is preserved beside this generated metadata note.\n\n"
++        + f"- SHA-256: `{digest}`\n"
++        + f"- Bytes: `{path.stat().st_size}`\n"
++        + f"- MIME guess: `{mime or 'unknown'}`\n"
++    )
++
++
++def write_markdown_for_file(source_rel: str, path: Path) -> tuple[Path, str, int, str]:
++    digest = sha256_file(path)
++    ext = path.suffix.lower()
++    if ext == ".md":
++        try:
++            chars = len(read_text_guess(path))
++        except Exception:
++            chars = 0
++        return path, "markdown-original", chars, digest
++    if ext in {".html", ".htm"}:
++        text = normalize_newlines(read_text_guess(path))
++        md_path = path.with_name(f"{path.name}.neurovault.md")
++        md_path.write_text(html_text_markdown(source_rel, path, digest, text), encoding="utf-8")
++        return md_path, "html-text", len(text), digest
++    if ext in TEXT_EXTS:
++        text = normalize_newlines(read_text_guess(path))
++        md_path = path.with_name(f"{path.name}.neurovault.md")
++        md_path.write_text(code_markdown(source_rel, path, digest, text), encoding="utf-8")
++        return md_path, "text-code", len(text), digest
++    md_path = path.with_name(f"{path.name}.neurovault.md")
++    md_path.write_text(binary_markdown(source_rel, path, digest), encoding="utf-8")
++    return md_path, "binary-metadata", 0, digest
++
++
++def should_skip_dir(path: Path, extra_skip_dirs: set[str] | None = None) -> bool:
++    extra_skip_dirs = extra_skip_dirs or set()
++    return path.name in SKIP_DIRS or path.name in extra_skip_dirs or path.name.startswith(".cache")
++
++
++def safe_zip_member(name: str) -> bool:
++    parts = Path(name.replace("\\", "/")).parts
++    return bool(parts) and not any(part in {"", ".", ".."} for part in parts)
++
++
++def iter_source_files(
++    source: Path,
++    extra_skip_dirs: set[str] | None = None,
++    extra_skip_filenames: set[str] | None = None,
++    extra_skip_exts: set[str] | None = None,
++) -> list[Path]:
++    extra_skip_dirs = extra_skip_dirs or set()
++    extra_skip_filenames = extra_skip_filenames or set()
++    extra_skip_exts = extra_skip_exts or set()
++    out: list[Path] = []
++    for root, dirs, files in os.walk(source):
++        root_path = Path(root)
++        dirs[:] = [d for d in dirs if not should_skip_dir(root_path / d, extra_skip_dirs)]
++        for name in files:
++            if name.startswith("~$") or name.lower().endswith(SKIP_SUFFIXES):
++                continue
++            if Path(name).suffix.lower() in SKIP_EXTS | extra_skip_exts:
++                continue
++            if name.lower() in SKIP_FILENAMES | extra_skip_filenames:
++                continue
++            out.append(root_path / name)
++    return sorted(out, key=lambda p: p.relative_to(source).as_posix().lower())
++
++
++def ensure_registry(nv_home: Path, brain_id: str, name: str, description: str, make_active: bool) -> None:
++    registry_path = nv_home / "brains.json"
++    data = json.loads(registry_path.read_text(encoding="utf-8"))
++    brains = data.setdefault("brains", [])
++    existing = next((b for b in brains if b.get("id") == brain_id), None)
++    if existing is None:
++        brains.append(
++            {
++                "created_at": now_utc(),
++                "description": description,
++                "id": brain_id,
++                "name": name,
++            }
++        )
++    else:
++        existing["name"] = name
++        existing["description"] = description
++    if make_active:
++        data["active"] = brain_id
++    tmp = registry_path.with_suffix(".json.tmp")
++    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++    tmp.replace(registry_path)
++
++
++def import_project(
++    source: Path,
++    nv_home: Path,
++    brain_id: str,
++    name: str,
++    make_active: bool,
++    extra_skip_dirs: set[str] | None = None,
++    extra_skip_filenames: set[str] | None = None,
++    extra_skip_exts: set[str] | None = None,
++) -> dict:
++    description = f"Project archive cloned from {source}"
++    ensure_registry(nv_home, brain_id, name, description, make_active)
++
++    vault = nv_home / "brains" / brain_id / "vault"
++    raw_root = vault / "_source_files" / source.name
++    report_root = vault / "_neurovault_index"
++    raw_root.mkdir(parents=True, exist_ok=True)
++    report_root.mkdir(parents=True, exist_ok=True)
++
++    rows: list[dict[str, str | int]] = []
++    copied = 0
++    converted = 0
++    binary = 0
++    existing_md = 0
++
++    for src in iter_source_files(source, extra_skip_dirs, extra_skip_filenames, extra_skip_exts):
++        rel = src.relative_to(source).as_posix()
++        dst = raw_root / rel
++        dst.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(src, dst)
++        copied += 1
++
++        md_path, mode, chars, digest = write_markdown_for_file(rel, dst)
++        ext = dst.suffix.lower()
++        if mode == "markdown-original":
++            existing_md += 1
++        elif mode in {"html-text", "text-code"}:
++            converted += 1
++        else:
++            binary += 1
++
++        rows.append(
++            {
++                "relative_path": rel,
++                "extension": ext,
++                "bytes": dst.stat().st_size,
++                "sha256": digest,
++                "mode": mode,
++                "text_chars": chars,
++                "markdown_path": md_path.relative_to(vault).as_posix(),
++            }
++        )
++
++        if ext == ".zip":
++            archive_slug = slugify(Path(rel).stem)
++            extract_root = raw_root / "_extracted_archives" / archive_slug
++            with zipfile.ZipFile(dst) as archive:
++                for member in archive.infolist():
++                    if member.is_dir() or not safe_zip_member(member.filename):
++                        continue
++                    member_rel = Path(member.filename.replace("\\", "/"))
++                    if any(part in SKIP_DIRS or part.startswith(".cache") for part in member_rel.parts):
++                        continue
++                    if member_rel.name.lower() in SKIP_FILENAMES:
++                        continue
++                    extracted = extract_root / member_rel
++                    extracted.parent.mkdir(parents=True, exist_ok=True)
++                    with archive.open(member) as src_handle, extracted.open("wb") as dst_handle:
++                        shutil.copyfileobj(src_handle, dst_handle)
++                    copied += 1
++                    extracted_rel = (
++                        Path("_source_files")
++                        / source.name
++                        / "_extracted_archives"
++                        / archive_slug
++                        / member_rel
++                    ).as_posix()
++                    archive_source_rel = f"{rel}!/{member.filename}"
++                    emd_path, emode, echars, edigest = write_markdown_for_file(
++                        archive_source_rel,
++                        extracted,
++                    )
++                    if emode == "markdown-original":
++                        existing_md += 1
++                    elif emode in {"html-text", "text-code"}:
++                        converted += 1
++                    else:
++                        binary += 1
++                    rows.append(
++                        {
++                            "relative_path": archive_source_rel,
++                            "extension": extracted.suffix.lower(),
++                            "bytes": extracted.stat().st_size,
++                            "sha256": edigest,
++                            "mode": f"zip-{emode}",
++                            "text_chars": echars,
++                            "markdown_path": emd_path.relative_to(vault).as_posix(),
++                        }
++                    )
++
++    csv_path = report_root / "project_import_report.csv"
++    with csv_path.open("w", encoding="utf-8", newline="") as handle:
++        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()) if rows else [])
++        if rows:
++            writer.writeheader()
++            writer.writerows(rows)
++
++    md_report = report_root / "00_PROJECT_IMPORT_OVERVIEW.md"
++    with md_report.open("w", encoding="utf-8") as handle:
++        handle.write(f"# Project Import: {name}\n\n")
++        handle.write(f"Generated: {now_utc()}\n\n")
++        handle.write(f"Source: `{source}`\n\n")
++        handle.write(f"Brain ID: `{brain_id}`\n\n")
++        handle.write("## Summary\n\n")
++        handle.write(f"- Files copied: {copied}\n")
++        handle.write(f"- Existing markdown files preserved: {existing_md}\n")
++        handle.write(f"- Text/code/html files converted to markdown sidecars: {converted}\n")
++        handle.write(f"- Binary assets represented by metadata notes: {binary}\n\n")
++        handle.write("Original files are preserved under `_source_files/`; generated markdown sidecars are what NeuroVault indexes.\n\n")
++        handle.write("## Files\n\n")
++        handle.write("| Source | Mode | Bytes | Markdown |\n")
++        handle.write("|---|---|---:|---|\n")
++        for row in rows:
++            handle.write(
++                f"| `{row['relative_path']}` | `{row['mode']}` | {row['bytes']} | `{row['markdown_path']}` |\n"
++            )
++
++    return {
++        "brain_id": brain_id,
++        "brain_name": name,
++        "vault": str(vault),
++        "raw_root": str(raw_root),
++        "files_copied": copied,
++        "existing_markdown": existing_md,
++        "converted_sidecars": converted,
++        "binary_metadata_notes": binary,
++        "report": str(md_report),
++        "csv": str(csv_path),
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description="Import a project folder into a NeuroVault brain.")
++    parser.add_argument("--source", required=True)
++    parser.add_argument("--nv-home", default=r"D:\NEURO-VAULT-STORAGE\.neurovault")
++    parser.add_argument("--brain-id")
++    parser.add_argument("--name")
++    parser.add_argument("--active", action="store_true")
++    parser.add_argument("--skip-dir", action="append", default=[], help="Additional directory basename to skip.")
++    parser.add_argument("--skip-file", action="append", default=[], help="Additional filename to skip.")
++    parser.add_argument("--skip-ext", action="append", default=[], help="Additional extension to skip, such as .png.")
++    args = parser.parse_args()
++
++    source = Path(args.source).resolve()
++    nv_home = Path(args.nv_home)
++    if not source.is_dir():
++        raise SystemExit(f"source folder not found: {source}")
++    if not (nv_home / "brains.json").is_file():
++        raise SystemExit(f"NeuroVault home not found: {nv_home}")
++
++    name = args.name or source.name
++    brain_id = args.brain_id or slugify(name)
++    extra_skip_dirs = set(args.skip_dir)
++    extra_skip_filenames = {name.lower() for name in args.skip_file}
++    extra_skip_exts = {
++        ext.lower() if ext.startswith(".") else f".{ext.lower()}"
++        for ext in args.skip_ext
++    }
++
++    result = import_project(
++        source,
++        nv_home,
++        brain_id,
++        name,
++        args.active,
++        extra_skip_dirs,
++        extra_skip_filenames,
++        extra_skip_exts,
++    )
++    print(json.dumps(result, ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/thesis_incremental_refresh.py b/scripts/thesis_incremental_refresh.py
+new file mode 100644
+index 0000000..f6c5552
+--- /dev/null
++++ b/scripts/thesis_incremental_refresh.py
+@@ -0,0 +1,181 @@
++from __future__ import annotations
++
++import hashlib
++import html
++import json
++import os
++import re
++import shutil
++import zipfile
++from datetime import datetime, timezone
++from pathlib import Path
++import xml.etree.ElementTree as ET
++
++
++SOURCE_ROOT = Path(r"C:\Users\steli\Desktop\PwC\uni (thesis)")
++VAULT_ROOT = Path(r"D:\NEURO-VAULT-STORAGE\.neurovault\brains\thesis\vault")
++DEST_ROOT = VAULT_ROOT / "_source_files" / "uni (thesis)"
++REPORT_ROOT = VAULT_ROOT / "_neurovault_index"
++
++SKIP_DIRS = {".git", ".claude", "__pycache__"}
++SKIP_NAMES = {
++    ".mcp.json",
++    ".mcp.json.pre-v031-switch-20260531-1305.bak",
++}
++SKIP_SUFFIXES = (".neurovault.md", ".neurovault.html", ".mammoth.html")
++
++DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def iter_source_files() -> list[Path]:
++    files: list[Path] = []
++    for root, dirs, names in os.walk(SOURCE_ROOT):
++        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
++        root_path = Path(root)
++        for name in names:
++            if name.startswith("~$") or name in SKIP_NAMES or name.endswith(SKIP_SUFFIXES):
++                continue
++            files.append(root_path / name)
++    return sorted(files, key=lambda p: p.relative_to(SOURCE_ROOT).as_posix().lower())
++
++
++def needs_copy(src: Path, dst: Path) -> bool:
++    if not dst.exists():
++        return True
++    src_stat = src.stat()
++    dst_stat = dst.stat()
++    if src_stat.st_size == dst_stat.st_size and abs(src_stat.st_mtime - dst_stat.st_mtime) <= 2:
++        return False
++    return sha256_file(src) != sha256_file(dst)
++
++
++def docx_text(path: Path) -> str:
++    parts: list[str] = []
++    with zipfile.ZipFile(path) as archive:
++        for name in ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"):
++            if name not in archive.namelist():
++                continue
++            root = ET.fromstring(archive.read(name))
++            if name != "word/document.xml":
++                parts.append(f"\n## {Path(name).stem.title()}\n")
++            for para in root.findall(".//w:p", DOCX_NS):
++                texts: list[str] = []
++                for node in para.iter():
++                    tag = node.tag.rsplit("}", 1)[-1]
++                    if tag == "t" and node.text:
++                        texts.append(node.text)
++                    elif tag == "tab":
++                        texts.append("\t")
++                    elif tag == "br":
++                        texts.append("\n")
++                line = "".join(texts).strip()
++                if line:
++                    parts.append(line)
++    text = "\n\n".join(parts)
++    return re.sub(r"\n{4,}", "\n\n\n", text).strip() or "[No text extracted from DOCX.]"
++
++
++def write_docx_sidecars(rel: str, dst: Path) -> tuple[Path, int, str]:
++    digest = sha256_file(dst)
++    stat = dst.stat()
++    text = docx_text(dst)
++    frontmatter = (
++        "---\n"
++        f"source_path: {json.dumps(rel, ensure_ascii=False)}\n"
++        f"source_sha256: {json.dumps(digest)}\n"
++        f"source_bytes: {stat.st_size}\n"
++        f"source_modified_utc: {json.dumps(datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat())}\n"
++        'conversion_mode: "docx-xml-text"\n'
++        "---\n\n"
++    )
++    md = (
++        frontmatter
++        + f"# NeuroVault Conversion: {rel}\n\n"
++        + "This sidecar was generated during a thesis incremental refresh. "
++        + "Original file is preserved beside this generated markdown sidecar.\n\n"
++        + f"Original SHA-256: `{digest}`\n\n"
++        + "## Extracted Text\n\n"
++        + text
++        + "\n"
++    )
++    md_path = dst.with_name(f"{dst.name}.neurovault.md")
++    md_path.write_text(md, encoding="utf-8")
++
++    html_path = dst.with_name(f"{dst.name}.neurovault.html")
++    html_path.write_text(
++        "<!doctype html><meta charset=\"utf-8\">"
++        f"<title>{html.escape(rel)}</title>"
++        f"<h1>NeuroVault Conversion: {html.escape(rel)}</h1>"
++        f"<pre>{html.escape(text)}</pre>",
++        encoding="utf-8",
++    )
++    return md_path, len(text), digest
++
++
++def main() -> int:
++    if not SOURCE_ROOT.is_dir():
++        raise SystemExit(f"Missing source thesis folder: {SOURCE_ROOT}")
++    if not DEST_ROOT.is_dir():
++        raise SystemExit(f"Missing SSD thesis clone: {DEST_ROOT}")
++
++    REPORT_ROOT.mkdir(parents=True, exist_ok=True)
++    rows: list[dict[str, object]] = []
++
++    for src in iter_source_files():
++        rel = src.relative_to(SOURCE_ROOT).as_posix()
++        dst = DEST_ROOT / rel
++        if not needs_copy(src, dst):
++            continue
++        dst.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(src, dst)
++        digest = sha256_file(dst)
++        mode = "binary-copied"
++        chars = 0
++        markdown_path = ""
++        if dst.suffix.lower() == ".docx":
++            md_path, chars, digest = write_docx_sidecars(rel, dst)
++            mode = "docx-xml-text"
++            markdown_path = md_path.relative_to(VAULT_ROOT).as_posix()
++        elif dst.suffix.lower() == ".md":
++            mode = "markdown-original"
++            markdown_path = dst.relative_to(VAULT_ROOT).as_posix()
++            chars = len(dst.read_text(encoding="utf-8", errors="replace"))
++
++        rows.append(
++            {
++                "relative_path": rel,
++                "mode": mode,
++                "bytes": dst.stat().st_size,
++                "sha256": digest,
++                "text_chars": chars,
++                "markdown_path": markdown_path,
++            }
++        )
++
++    report = REPORT_ROOT / f"thesis_incremental_update_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.md"
++    with report.open("w", encoding="utf-8") as handle:
++        handle.write("# Thesis Incremental Update\n\n")
++        handle.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
++        handle.write(f"Source: `{SOURCE_ROOT}`\n\n")
++        handle.write("Copied new/changed files into the SSD thesis vault and generated searchable sidecars for new DOCX files.\n\n")
++        handle.write("| Source | Mode | Bytes | Markdown |\n")
++        handle.write("|---|---|---:|---|\n")
++        for row in rows:
++            handle.write(
++                f"| `{row['relative_path']}` | `{row['mode']}` | {row['bytes']} | `{row['markdown_path']}` |\n"
++            )
++
++    print(json.dumps({"copied_or_changed": len(rows), "report": str(report), "rows": rows}, indent=2, ensure_ascii=False))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index af0dde6..2c50c9f 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -33,6 +33,19 @@ pub struct NoteMeta {
+ /// app launches BEFORE the Python server has had a chance to migrate, this
+ /// helper still finds the vault so the UI isn't empty.
+ fn nv_home() -> PathBuf {
++    if let Ok(explicit) = std::env::var("NEUROVAULT_HOME") {
++        if !explicit.is_empty() {
++            return PathBuf::from(explicit);
++        }
++    }
++    if let Ok(legacy) = std::env::var("ENGRAM_HOME") {
++        if !legacy.is_empty() {
++            return PathBuf::from(legacy);
++        }
++    }
++    if let Some(ssd_home) = plugged_in_ssd_home() {
++        return ssd_home;
++    }
+     let home = dirs::home_dir().expect("Could not determine home directory");
+     let new_home = home.join(".neurovault");
+     if new_home.exists() {
+@@ -46,6 +59,27 @@ fn nv_home() -> PathBuf {
+     new_home
+ }
+ 
++fn plugged_in_ssd_home() -> Option<PathBuf> {
++    #[cfg(windows)]
++    {
++        let preferred = PathBuf::from(r"D:\NEURO-VAULT-STORAGE\.neurovault");
++        if preferred.join("brains.json").is_file() {
++            return Some(preferred);
++        }
++
++        for drive in b'A'..=b'Z' {
++            let candidate = PathBuf::from(format!(
++                "{}:\\NEURO-VAULT-STORAGE\\.neurovault",
++                drive as char
++            ));
++            if candidate.join("brains.json").is_file() {
++                return Some(candidate);
++            }
++        }
++    }
++    None
++}
++
+ /// Find the active vault directory. Checks (in order):
+ /// 1. brains.json registry (multi-brain mode)
+ /// 2. Legacy single-brain ~/.neurovault/vault/ (pre-multi-brain migration)
+diff --git a/src-tauri/src/memory/paths.rs b/src-tauri/src/memory/paths.rs
+index ad028ab..6cc8c5e 100644
+--- a/src-tauri/src/memory/paths.rs
++++ b/src-tauri/src/memory/paths.rs
+@@ -21,7 +21,8 @@ use std::path::PathBuf;
+ /// 2. `$ENGRAM_HOME` if set (legacy — mirrors Python's backward-compat
+ ///    shim; emits no warning from Rust because the message belongs to
+ ///    the CLI/subprocess layer, not the core library)
+-/// 3. `%USERPROFILE%\.neurovault` on Windows / `~/.neurovault`
++/// 3. A plugged-in SSD vault at `?:\NEURO-VAULT-STORAGE\.neurovault`
++/// 4. `%USERPROFILE%\.neurovault` on Windows / `~/.neurovault`
+ ///    elsewhere via the `dirs` crate
+ pub fn nv_home() -> PathBuf {
+     if let Ok(explicit) = env::var("NEUROVAULT_HOME") {
+@@ -34,6 +35,9 @@ pub fn nv_home() -> PathBuf {
+             return PathBuf::from(legacy);
+         }
+     }
++    if let Some(ssd_home) = plugged_in_ssd_home() {
++        return ssd_home;
++    }
+     dirs::home_dir()
+         .map(|h| h.join(".neurovault"))
+         // If we can't resolve a home dir at all we fall back to the
+@@ -43,6 +47,27 @@ pub fn nv_home() -> PathBuf {
+         .unwrap_or_else(|| PathBuf::from(".neurovault"))
+ }
+ 
++fn plugged_in_ssd_home() -> Option<PathBuf> {
++    #[cfg(windows)]
++    {
++        let preferred = PathBuf::from(r"D:\NEURO-VAULT-STORAGE\.neurovault");
++        if preferred.join("brains.json").is_file() {
++            return Some(preferred);
++        }
++
++        for drive in b'A'..=b'Z' {
++            let candidate = PathBuf::from(format!(
++                "{}:\\NEURO-VAULT-STORAGE\\.neurovault",
++                drive as char
++            ));
++            if candidate.join("brains.json").is_file() {
++                return Some(candidate);
++            }
++        }
++    }
++    None
++}
++
+ /// Directory that holds every brain's per-brain state.
+ pub fn brains_root() -> PathBuf {
+     nv_home().join("brains")
+diff --git a/src/components/BrainSelector.tsx b/src/components/BrainSelector.tsx
+index 30654e1..55b3e42 100644
+--- a/src/components/BrainSelector.tsx
++++ b/src/components/BrainSelector.tsx
+@@ -1,4 +1,5 @@
+-import { useState, useRef, useEffect } from "react";
++import { useState, useRef, useEffect, type CSSProperties } from "react";
++import { createPortal } from "react-dom";
+ import { useBrainStore } from "../stores/brainStore";
+ import { API_HOST } from "../lib/config";
+ 
+@@ -6,6 +7,18 @@ const API = API_HOST;
+ 
+ interface BrainStats { note_count: number; total_bytes: number }
+ 
++const PORTAL_THEME_VARS = [
++  "--nv-bg",
++  "--nv-surface",
++  "--nv-border",
++  "--nv-text",
++  "--nv-text-dim",
++  "--nv-text-muted",
++  "--nv-accent",
++  "--nv-accent-glow",
++  "--nv-negative",
++] as const;
++
+ function formatBytes(n: number): string {
+   if (n < 1024) return `${n} B`;
+   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+@@ -17,6 +30,13 @@ export function BrainSelector() {
+   const { brains, activeBrainName, loading, switchBrain, createBrain, updateBrain, deleteBrain, loadBrains } =
+     useBrainStore();
+   const [open, setOpen] = useState(false);
++  const [viewMode, setViewMode] = useState<"list" | "grid">(() => {
++    try {
++      return localStorage.getItem("neurovault.brainSelector.view") === "grid" ? "grid" : "list";
++    } catch {
++      return "list";
++    }
++  });
+   const [creating, setCreating] = useState(false);
+   const [newName, setNewName] = useState("");
+   const [newDesc, setNewDesc] = useState("");
+@@ -25,10 +45,51 @@ export function BrainSelector() {
+   const [editingId, setEditingId] = useState<string | null>(null);
+   const [editName, setEditName] = useState("");
+   const [editDesc, setEditDesc] = useState("");
+-  const dropdownRef = useRef<HTMLDivElement>(null);
++  const [portalTheme, setPortalTheme] = useState<CSSProperties>({});
++  const [gridBounds, setGridBounds] = useState<CSSProperties>({});
++  const triggerRef = useRef<HTMLDivElement>(null);
++  const panelRef = useRef<HTMLDivElement>(null);
++  const isGrid = viewMode === "grid";
+ 
+   useEffect(() => { loadBrains(); }, [loadBrains]);
+ 
++  useEffect(() => {
++    try { localStorage.setItem("neurovault.brainSelector.view", viewMode); } catch { /* ignore */ }
++  }, [viewMode]);
++
++  useEffect(() => {
++    if (!open || !triggerRef.current) return;
++    const computed = getComputedStyle(triggerRef.current);
++    const next: CSSProperties = {};
++    for (const key of PORTAL_THEME_VARS) {
++      const value = computed.getPropertyValue(key).trim();
++      if (value) {
++        (next as Record<string, string>)[key] = value;
++      }
++    }
++    setPortalTheme(next);
++  }, [open]);
++
++  useEffect(() => {
++    if (!open || !isGrid) return;
++
++    const syncBounds = () => {
++      const sidebar = triggerRef.current?.closest("[data-neurovault-sidebar]") as HTMLElement | null;
++      const rect = sidebar?.getBoundingClientRect();
++      if (!rect) return;
++      setGridBounds({
++        top: rect.top,
++        left: rect.right,
++        right: 0,
++        bottom: Math.max(0, window.innerHeight - rect.bottom),
++      });
++    };
++
++    syncBounds();
++    window.addEventListener("resize", syncBounds);
++    return () => window.removeEventListener("resize", syncBounds);
++  }, [open, isGrid]);
++
+   useEffect(() => {
+     if (!open || brains.length === 0) return;
+     // Fetch per-brain stats once the dropdown opens. Fire all requests in
+@@ -54,7 +115,10 @@ export function BrainSelector() {
+   useEffect(() => {
+     if (!open) return;
+     const handler = (e: MouseEvent) => {
+-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
++      const target = e.target as Node;
++      const insideTrigger = triggerRef.current?.contains(target);
++      const insidePanel = panelRef.current?.contains(target);
++      if (!insideTrigger && !insidePanel) {
+         setOpen(false);
+         setCreating(false);
+       }
+@@ -65,6 +129,7 @@ export function BrainSelector() {
+ 
+   const handleSwitch = async (brainId: string) => {
+     setOpen(false);
++    setViewMode("list");
+     await switchBrain(brainId);
+   };
+ 
+@@ -131,11 +196,12 @@ export function BrainSelector() {
+   };
+ 
+   return (
+-    <div className="relative" ref={dropdownRef}>
++    <div className="relative flex-1 min-w-0 z-[60]" ref={triggerRef}>
+       {/* Trigger — shows current brain name */}
+       <button
++        type="button"
+         onClick={() => setOpen((o) => !o)}
+-        className="flex items-center gap-1.5 px-2 py-1.5 text-[12px] font-[Geist,sans-serif] rounded-md transition-all w-full text-left"
++        className="flex items-center gap-1.5 px-2 py-1.5 text-[12px] font-[Geist,sans-serif] rounded-md transition-all w-full min-w-0 text-left"
+         style={{ color: "var(--nv-text-muted)" }}
+         disabled={loading}
+       >
+@@ -153,17 +219,90 @@ export function BrainSelector() {
+       </button>
+ 
+       {/* Dropdown — opens UPWARD since we're at the bottom */}
+-      {open && (
++      {open && createPortal(
+         <div
+-          className="absolute bottom-full left-0 mb-1 w-[260px] rounded-lg shadow-2xl z-50 overflow-hidden"
++          ref={panelRef}
++          className={`z-[80] overflow-hidden ${
++            isGrid
++              ? "fixed rounded-none"
++              : "fixed left-3 bottom-[58px] rounded-lg shadow-2xl"
++          }`}
+           style={{
++            ...portalTheme,
++            ...(isGrid ? gridBounds : {}),
++            width: isGrid ? undefined : "260px",
+             background: "var(--nv-bg)",
+-            border: "1px solid var(--nv-border)",
+-            boxShadow: "0 -8px 32px rgba(0,0,0,0.3)",
++            border: isGrid ? "0" : "1px solid var(--nv-border)",
++            boxShadow: isGrid ? "none" : "0 -8px 32px rgba(0,0,0,0.3)",
+           }}
+         >
++          <div
++            className="px-2.5 py-2 flex items-center justify-between gap-2"
++            style={{ borderBottom: "1px solid var(--nv-border)" }}
++          >
++            <div className="min-w-0">
++              <p className="text-[11px] font-medium font-[Geist,sans-serif]" style={{ color: "var(--nv-text)" }}>
++                Vaults
++              </p>
++              <p className="text-[10px] font-[Geist,sans-serif]" style={{ color: "var(--nv-text-dim)" }}>
++                {brains.length} total
++              </p>
++            </div>
++            <div className="flex items-center gap-0.5 rounded-md p-0.5" style={{ background: "var(--nv-surface)" }}>
++              <button
++                onClick={() => setViewMode("list")}
++                className="w-6 h-6 rounded flex items-center justify-center transition-colors"
++                style={{
++                  color: viewMode === "list" ? "var(--nv-text)" : "var(--nv-text-dim)",
++                  background: viewMode === "list" ? "var(--nv-bg)" : "transparent",
++                }}
++                title="List view"
++                aria-label="List view"
++                aria-pressed={viewMode === "list"}
++              >
++                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
++                </svg>
++              </button>
++              <button
++                onClick={() => setViewMode("grid")}
++                className="w-6 h-6 rounded flex items-center justify-center transition-colors"
++                style={{
++                  color: viewMode === "grid" ? "var(--nv-text)" : "var(--nv-text-dim)",
++                  background: viewMode === "grid" ? "var(--nv-bg)" : "transparent",
++                }}
++                title="Grid view"
++                aria-label="Grid view"
++                aria-pressed={viewMode === "grid"}
++              >
++                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />
++                </svg>
++              </button>
++              {isGrid && (
++                <button
++                  onClick={() => {
++                    setOpen(false);
++                    setViewMode("list");
++                  }}
++                  className="w-6 h-6 rounded flex items-center justify-center transition-colors"
++                  style={{ color: "var(--nv-text-dim)", background: "transparent" }}
++                  title="Close"
++                  aria-label="Close vault grid"
++                >
++                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M18 6L6 18" />
++                  </svg>
++                </button>
++              )}
++            </div>
++          </div>
++
+           {/* Vault list */}
+-          <div className="max-h-[280px] overflow-y-auto py-1">
++          <div
++            className={`${isGrid ? "h-[calc(100%-45px)] p-2 grid gap-2 content-start" : "max-h-[280px] py-1"} overflow-y-auto`}
++            style={isGrid ? { gridTemplateColumns: "repeat(5, minmax(0, 1fr))" } : undefined}
++          >
+             {brains.map((brain) => {
+               const isEditing = editingId === brain.id;
+               const isConfirming = confirmDelete === brain.id;
+@@ -180,7 +319,11 @@ export function BrainSelector() {
+                   <div
+                     key={brain.id}
+                     className="px-3 py-2.5 space-y-2"
+-                    style={{ background: "var(--nv-surface)", borderLeft: "2px solid var(--nv-accent)" }}
++                    style={{
++                      background: "var(--nv-surface)",
++                      borderLeft: "2px solid var(--nv-accent)",
++                      gridColumn: isGrid ? "1 / -1" : undefined,
++                    }}
+                   >
+                     <input
+                       autoFocus
+@@ -233,7 +376,11 @@ export function BrainSelector() {
+                   <div
+                     key={brain.id}
+                     className="px-3 py-2.5"
+-                    style={{ background: "var(--nv-surface)", borderLeft: "2px solid var(--nv-negative)" }}
++                    style={{
++                      background: "var(--nv-surface)",
++                      borderLeft: "2px solid var(--nv-negative)",
++                      gridColumn: isGrid ? "1 / -1" : undefined,
++                    }}
+                   >
+                     <p className="text-[11px] font-[Geist,sans-serif] mb-1.5" style={{ color: "var(--nv-text)" }}>
+                       Remove <span className="font-medium">{brain.name}</span>?
+@@ -268,20 +415,43 @@ export function BrainSelector() {
+               return (
+                 <div
+                   key={brain.id}
+-                  className="group relative flex items-start gap-2.5 px-3 py-2 transition-colors"
+-                  style={{ background: brain.is_active ? "var(--nv-surface)" : undefined }}
++                  className={`group relative transition-colors ${
++                    isGrid
++                      ? "min-h-[104px] rounded-md border p-2 flex flex-col"
++                      : "flex items-start gap-2.5 px-3 py-2"
++                  }`}
++                  style={{
++                    background: brain.is_active ? "var(--nv-surface)" : undefined,
++                    borderColor: isGrid
++                      ? brain.is_active ? "var(--nv-accent)" : "var(--nv-border)"
++                      : undefined,
++                  }}
+                 >
+                   <button
+                     onClick={() => handleSwitch(brain.id)}
+-                    className="flex items-start gap-2.5 min-w-0 flex-1 text-left cursor-pointer"
++                    className={`min-w-0 flex-1 text-left cursor-pointer ${
++                      isGrid ? "flex flex-col gap-1.5" : "flex items-start gap-2.5"
++                    }`}
+                   >
+                     <span
+-                      className="w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0"
++                      className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${isGrid ? "" : "mt-1.5"}`}
+                       style={{ backgroundColor: brain.is_active ? "var(--nv-accent)" : "var(--nv-text-dim)" }}
+                     />
+                     <div className="min-w-0 flex-1">
+-                      <div className="flex items-center gap-1.5">
+-                        <p className="text-[12px] font-medium font-[Geist,sans-serif] truncate" style={{ color: "var(--nv-text)" }}>
++                      <div className={`flex items-center gap-1.5 ${isGrid ? "pr-10" : ""}`}>
++                        <p
++                          className={`font-medium font-[Geist,sans-serif] ${isGrid ? "text-[11px] leading-snug" : "text-[12px] truncate"}`}
++                          style={{
++                            color: "var(--nv-text)",
++                            ...(isGrid ? {
++                              display: "-webkit-box",
++                              WebkitLineClamp: 2,
++                              WebkitBoxOrient: "vertical" as const,
++                              overflow: "hidden",
++                            } : {}),
++                          }}
++                          title={brain.name}
++                        >
+                           {brain.name}
+                         </p>
+                         {brain.vault_path && (
+@@ -304,7 +474,19 @@ export function BrainSelector() {
+                         </p>
+                       ) : (
+                         brain.description && (
+-                          <p className="text-[10px] font-[Geist,sans-serif] truncate" style={{ color: "var(--nv-text-dim)" }}>
++                          <p
++                            className={`text-[10px] font-[Geist,sans-serif] ${isGrid ? "" : "truncate"}`}
++                            style={{
++                              color: "var(--nv-text-dim)",
++                              ...(isGrid ? {
++                                display: "-webkit-box",
++                                WebkitLineClamp: 2,
++                                WebkitBoxOrient: "vertical" as const,
++                                overflow: "hidden",
++                              } : {}),
++                            }}
++                            title={brain.description}
++                          >
+                             {brain.description}
+                           </p>
+                         )
+@@ -320,7 +502,7 @@ export function BrainSelector() {
+                       })()}
+                     </div>
+                   </button>
+-                  <div className="flex items-center gap-0.5 flex-shrink-0">
++                  <div className={isGrid ? "absolute top-1.5 right-1.5 flex items-center gap-0.5" : "flex items-center gap-0.5 flex-shrink-0"}>
+                     {brain.is_active && (
+                       <span className="text-[10px] mt-0.5" style={{ color: "var(--nv-accent)" }}>✓</span>
+                     )}
+@@ -449,7 +631,8 @@ export function BrainSelector() {
+               </button>
+             </div>
+           )}
+-        </div>
++        </div>,
++        document.body
+       )}
+     </div>
+   );
+diff --git a/src/components/GraphFilterPanel.tsx b/src/components/GraphFilterPanel.tsx
+index 2a9afb6..98cb615 100644
+--- a/src/components/GraphFilterPanel.tsx
++++ b/src/components/GraphFilterPanel.tsx
+@@ -9,7 +9,7 @@
+  */
+ 
+ import { useState } from "react";
+-import { useGraphSettingsStore, PALETTES } from "../stores/graphSettingsStore";
++import { useGraphSettingsStore, PALETTES, GRAPH_BACKGROUND_COLORS } from "../stores/graphSettingsStore";
+ import type {
+   GraphPalette,
+   GraphNodeShape,
+@@ -435,6 +435,53 @@ export function GraphFilterPanel({
+           open={openSections.appearance}
+           setOpen={() => toggleSection("appearance")}
+         >
++          <div className="space-y-2">
++            <div
++              className="flex items-center justify-between text-[11px] font-[Geist,sans-serif]"
++              style={{ color: "var(--nv-text-muted)" }}
++            >
++              <span>Graph background</span>
++              <button
++                onClick={() => s.setGraphBackgroundColor("#0b0b12")}
++                className="text-[10px] underline transition-colors"
++                style={{ color: "var(--nv-text-dim)" }}
++              >
++                reset
++              </button>
++            </div>
++            <div className="grid grid-cols-5 gap-1.5">
++              {GRAPH_BACKGROUND_COLORS.map((bg) => {
++                const selected = s.graphBackgroundColor === bg.value;
++                return (
++                  <button
++                    key={bg.value}
++                    onClick={() => s.setGraphBackgroundColor(bg.value)}
++                    title={bg.label}
++                    className="h-7 rounded-md border transition-all"
++                    style={{
++                      background: bg.value,
++                      borderColor: selected ? "var(--nv-accent)" : "var(--nv-border)",
++                      boxShadow: selected ? "0 0 0 1px var(--nv-accent)" : "none",
++                    }}
++                    aria-label={`Set graph background to ${bg.label}`}
++                  />
++                );
++              })}
++            </div>
++            <label className="flex items-center gap-2 text-[11px] font-[Geist,sans-serif]" style={{ color: "var(--nv-text-muted)" }}>
++              <input
++                type="color"
++                value={s.graphBackgroundColor}
++                onChange={(e) => s.setGraphBackgroundColor(e.target.value)}
++                className="w-8 h-7 rounded cursor-pointer flex-shrink-0"
++                style={{ background: "transparent", border: "1px solid var(--nv-border)" }}
++              />
++              <span className="flex-1">Custom colour</span>
++              <span className="font-mono text-[10px]" style={{ color: "var(--nv-text-dim)" }}>
++                {s.graphBackgroundColor}
++              </span>
++            </label>
++          </div>
+           <div className="space-y-2">
+             <div
+               className="text-[11px] font-[Geist,sans-serif]"
+diff --git a/src/components/NeuralGraph.tsx b/src/components/NeuralGraph.tsx
+index b0d00d6..6d30cc3 100644
+--- a/src/components/NeuralGraph.tsx
++++ b/src/components/NeuralGraph.tsx
+@@ -511,6 +511,7 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+   // consumers of the others (Zustand subscribes per-selector).
+   const palette = useGraphSettingsStore((s) => s.palette);
+   const nodeShape = useGraphSettingsStore((s) => s.nodeShape);
++  const graphBackgroundColor = useGraphSettingsStore((s) => s.graphBackgroundColor);
+   const showClusterLabels = useGraphSettingsStore((s) => s.showClusterLabels);
+   // User colour overrides — folder name → hex, cluster name → hex.
+   // Selecting individually so a change to one doesn't rerender the
+@@ -1897,7 +1898,7 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+     <div
+       ref={containerRef}
+       className="flex-1 relative overflow-hidden"
+-      style={{ background: "var(--nv-bg)" }}
++      style={{ background: graphBackgroundColor }}
+       onMouseMove={handleContainerMouseMove}
+       onMouseLeave={() => scheduleClose()}
+     >
+@@ -2132,7 +2133,7 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+             graphData={graphData}
+             width={size.w}
+             height={size.h}
+-            backgroundColor="#0b0b12"
++            backgroundColor={graphBackgroundColor}
+             nodeLabel={(n: unknown) => (n as SimNode).title}
+             nodeRelSize={5}
+             nodeVal={nodeVal}
+diff --git a/src/components/Sidebar.tsx b/src/components/Sidebar.tsx
+index 02e7714..ad85a63 100644
+--- a/src/components/Sidebar.tsx
++++ b/src/components/Sidebar.tsx
+@@ -248,6 +248,7 @@ export function Sidebar({
+ 
+   return (
+     <div
++      data-neurovault-sidebar
+       className="h-full flex flex-col backdrop-blur-[10px] relative"
+       style={{
+         width: sidebarWidth,
+diff --git a/src/stores/graphSettingsStore.ts b/src/stores/graphSettingsStore.ts
+index 250d4e9..685de3e 100644
+--- a/src/stores/graphSettingsStore.ts
++++ b/src/stores/graphSettingsStore.ts
+@@ -18,6 +18,21 @@ import { create } from "zustand";
+ export type GraphPalette = "warm" | "cool" | "mono" | "vivid";
+ export type GraphNodeShape = "circle" | "square" | "hex";
+ 
++export const GRAPH_BACKGROUND_COLORS = [
++  { value: "#0b0b12", label: "Vault Noir" },
++  { value: "#111217", label: "Graphite" },
++  { value: "#171717", label: "Charcoal" },
++  { value: "#1f2328", label: "Slate" },
++  { value: "#202124", label: "Neutral Dark" },
++  { value: "#262626", label: "Stone" },
++  { value: "#2f3437", label: "Ash" },
++  { value: "#f4f1ea", label: "Warm Paper" },
++  { value: "#eef1f4", label: "Mist" },
++  { value: "#f7f7f5", label: "Soft White" },
++  { value: "#101820", label: "Deep Blue" },
++  { value: "#141f1c", label: "Deep Green" },
++] as const;
++
+ /** Hand-tuned palettes — opinionated defaults beat infinite color
+  *  pickers for an OSS tool. Each palette is 8 hues meant to look
+  *  cohesive against the Vault Noir background. */
+@@ -96,6 +111,7 @@ export function folderColor(
+ interface GraphSettings {
+   palette: GraphPalette;
+   nodeShape: GraphNodeShape;
++  graphBackgroundColor: string;
+   /** When true, every cluster centroid gets a folder label at all
+    *  times (the original behaviour). When false, only the cluster of
+    *  the focused node is labelled (Phase 4 default). */
+@@ -189,6 +205,7 @@ const STORAGE_KEY = "nv.graph.settings";
+ const DEFAULTS: GraphSettings = {
+   palette: "warm",
+   nodeShape: "circle",
++  graphBackgroundColor: "#0b0b12",
+   showClusterLabels: false,
+   analyticsMode: false,
+   analyticsResizeByImportance: true,
+@@ -254,6 +271,10 @@ function load(): GraphSettings {
+       return {
+         palette,
+         nodeShape,
++        graphBackgroundColor:
++          typeof parsed.graphBackgroundColor === "string" && HEX_RE.test(parsed.graphBackgroundColor)
++            ? parsed.graphBackgroundColor.toLowerCase()
++            : DEFAULTS.graphBackgroundColor,
+         showClusterLabels: bool("showClusterLabels", false),
+         analyticsMode: bool("analyticsMode", false),
+         analyticsResizeByImportance: bool("analyticsResizeByImportance", true),
+@@ -285,6 +306,7 @@ function load(): GraphSettings {
+ interface GraphSettingsStore extends GraphSettings {
+   setPalette: (p: GraphPalette) => void;
+   setNodeShape: (s: GraphNodeShape) => void;
++  setGraphBackgroundColor: (color: string) => void;
+   setShowClusterLabels: (v: boolean) => void;
+   setAnalyticsMode: (v: boolean) => void;
+   toggleAnalyticsMode: () => void;
+@@ -334,6 +356,12 @@ export const useGraphSettingsStore = create<GraphSettingsStore>((set, get) => ({
+     set({ nodeShape });
+     persist({ ...get(), nodeShape });
+   },
++  setGraphBackgroundColor: (graphBackgroundColor) => {
++    if (!HEX_RE.test(graphBackgroundColor)) return;
++    const color = graphBackgroundColor.toLowerCase();
++    set({ graphBackgroundColor: color });
++    persist({ ...get(), graphBackgroundColor: color });
++  },
+   setShowClusterLabels: (showClusterLabels) => {
+     set({ showClusterLabels });
+     persist({ ...get(), showClusterLabels });
+-- 
+2.53.0.windows.2
+

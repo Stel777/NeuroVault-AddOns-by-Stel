@@ -1,0 +1,1185 @@
+From 56b68558e32bfd2718d83e65a6b7d729f6fa6bff Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Fri, 12 Jun 2026 18:38:47 +0300
+Subject: [PATCH 04/11] feat(skills): add update-brain + update-neurovault-app
+
+- /update-neurovault-app: rolling one-deep backup + rebase local tweaks
+  onto a newer upstream release; stages the MCP sidecar; launch + verify.
+- /update-brain: refresh project content into SSD brains (FULL/PROJECT),
+  read-only staleness scan, numbered-list exclusions, opt-in new-brain
+  creation, opt-in master sync; honors master's Not Project Brains list.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .claude/skills/update-brain/SKILL.md          | 224 ++++++++++++++++
+ .claude/skills/update-brain/scan.py           | 248 ++++++++++++++++++
+ .claude/skills/update-neurovault-app/SKILL.md | 206 +++++++++++++++
+ .../stage-sidecar-dev.ps1                     |  66 +++++
+ index.html                                    |   2 +
+ src-tauri/capabilities/default.json           |   4 +-
+ src-tauri/src/lib.rs                          |  71 +++++
+ src/App.tsx                                   |  67 ++++-
+ src/components/GraphFilterPanel.tsx           |   9 +
+ src/components/NeuralGraph.tsx                |  66 ++++-
+ src/stores/graphSettingsStore.ts              |   8 +
+ 11 files changed, 963 insertions(+), 8 deletions(-)
+ create mode 100644 .claude/skills/update-brain/SKILL.md
+ create mode 100644 .claude/skills/update-brain/scan.py
+ create mode 100644 .claude/skills/update-neurovault-app/SKILL.md
+ create mode 100644 .claude/skills/update-neurovault-app/stage-sidecar-dev.ps1
+
+diff --git a/.claude/skills/update-brain/SKILL.md b/.claude/skills/update-brain/SKILL.md
+new file mode 100644
+index 0000000..c1734e4
+--- /dev/null
++++ b/.claude/skills/update-brain/SKILL.md
+@@ -0,0 +1,224 @@
++---
++name: update-brain
++description: >
++  Refresh project CONTENT into NeuroVault brains on the SSD (the brain at
++  D:\NEURO-VAULT-STORAGE\.neurovault). Clones + incrementally re-indexes a
++  project's working folder into its matching brain, and can discover projects
++  that were never imported at all. Two modes: FULL (sweep every brain + scan
++  project-root folders for never-imported projects) or PROJECT (just the one
++  the user is working on). Always shows a read-only staleness report and asks
++  for confirmation before writing. Invoke when the user says "update the brain",
++  "update brain", "refresh my project in the brain", "index this project",
++  "did this project get passed to the brain", or similar. This is CONTENT/data,
++  NOT the app code — updating the app is /update-neurovault-app.
++---
++
++# Update brain (refresh project content into the SSD brains)
++
++The user keeps their projects in working folders (mostly under
++`C:\Users\steli\Documents\Claude_Projects\<Project>`) and mirrors each one into a
++matching **brain** on the SSD (`D:\NEURO-VAULT-STORAGE\.neurovault\brains\<id>\`).
++The mirror is done by `scripts/import_project_vault.py`, which copies the real
++source (skipping `node_modules`, `dist`, `target`, media, lockfiles, etc.),
++writes markdown sidecars NeuroVault indexes, and registers the brain in
++`brains.json`. Re-running it is **incremental** — sha256 means only changed files
++are touched.
++
++This skill wraps that into a safe, confirmed workflow. **Read-only first, write
++only after the user okays it.**
++
++## Model — run it on Sonnet, escalate to Opus only if genuinely stuck
++
++This is a mechanical task — run a script, copy/convert files, report. It does NOT
++need Opus-level reasoning. Run it **automatically on Sonnet**:
++
++1. The orchestrator (whatever model the session is on) handles the **interactive**
++   parts: pick mode, run the read-only `scan.py`, show the staleness report, and
++   get the user's scope confirmation (which stale brains to refresh, which
++   never-imported projects to create).
++2. Dispatch the **execution** (the actual `import_project_vault.py` /
++   `thesis_incremental_refresh.py` runs) to a **Sonnet subagent** via the Agent
++   tool (`subagent_type: general-purpose`, `model: sonnet`). Give it the explicit,
++   already-approved list of `(source, brain_id, name)` imports so it doesn't need
++   to re-ask anything. It runs them, captures each JSON summary, and reports back.
++3. **Escalate to Opus only if the Sonnet subagent hits something genuinely hard** —
++   a script crash it can't diagnose, an encoding/parse failure, an ambiguous
++   brain↔source mapping. It should STOP and report the problem rather than guess;
++   the orchestrator then either handles it directly or spawns an Opus subagent for
++   that one item. Routine imports should never need this.
++
++In short: **Sonnet does the work, Opus is the break-glass.** The user has approved
++this delegation pattern explicitly.
++
++## Preconditions
++
++- The SSD must be plugged in. Verify `D:\NEURO-VAULT-STORAGE\.neurovault\brains.json`
++  exists (if the drive mounts as another letter, pass `--nv-home <letter>:\...`).
++- `python` available (3.10+). The two tools used:
++  - `.claude/skills/update-brain/scan.py` — read-only discovery + staleness.
++  - `scripts/import_project_vault.py` — the actual copy/index (writes).
++- The app can stay running — its vault watcher will index new sidecars as they land.
++
++## Step 1 — Pick the mode
++
++Ask the user (AskUserQuestion) **FULL or PROJECT**:
++- **FULL** — sweep every brain for staleness AND scan project-root folder(s) for
++  projects that were never imported.
++- **PROJECT** — just refresh the single project the user is working on (default to
++  the current working directory's project, but confirm the folder).
++
++---
++
++## Step 2 (PROJECT mode) — one project
++
++1. Determine the project folder. Default guess: the repo/folder the user is in;
++   otherwise ask for the path.
++2. Read-only staleness:
++   ```bash
++   python .claude/skills/update-brain/scan.py --source "<project folder>"
++   ```
++   Parse the `===JSON===` block. It tells you `imported` (bool), the `brain_id`,
++   and `staleness` (`new`, `changed`, `total`).
++3. **Confirm before writing**, naming the project explicitly, e.g.:
++   > "Updating **Makeup Game** will refresh the **makeup-game** brain on the SSD
++   > (+0 new, ~3 changed). Proceed?"
++   - If `imported` is false, say it will **create a new brain** instead.
++   - If `new == 0 and changed == 0`, tell them it's already up to date and ask
++     whether to run anyway (usually no).
++4. On confirmation, import (incremental):
++   ```bash
++   python scripts/import_project_vault.py --source "<project folder>" \
++     --brain-id <brain_id> --name "<Project Name>"
++   ```
++   - For a **new** project omit `--brain-id` (it derives one) and set `--name`.
++   - Add `--active` only if the user wants to switch the app to that brain now.
++5. Report what changed (the importer prints a JSON summary: files copied,
++   converted, etc.).
++
++---
++
++## Step 3 (FULL mode) — sweep + discover
++
++1. Decide which **project-root folders** to scan for never-imported projects.
++   Default root: `C:\Users\steli\Documents\Claude_Projects`. Ask if the user wants
++   to add more roots (multiple `--roots` allowed — e.g. another drive/folder where
++   projects live). Pass each as a separate `--roots`.
++2. Read-only full report:
++   ```bash
++   python .claude/skills/update-brain/scan.py \
++     --roots "C:\Users\steli\Documents\Claude_Projects"
++   # add: --roots "<another root>" ... as needed
++   ```
++   Show the user the human-readable section: which brains are `up to date` vs
++   `STALE (+N new, ~M changed)`, and the `NEW:` never-imported folders. Parse the
++   `===JSON===` block for the actionable lists (`brains[]`, `unimported[]`).
++3. **Confirm scope before writing — show a NUMBERED LIST and let the user exclude.**
++   Present every candidate action as one flat numbered list, stale-refreshes and
++   new-brain-creations together, each line tagged so the user can see which is which.
++   Then ask which numbers to EXCLUDE (the default is "do all of them"). Example:
++
++   ```
++   These projects will be passed into the brain. Tell me any numbers to SKIP
++   (e.g. "2, 4 no"), or just say go to do them all:
++     1. [refresh] ds2                       (+353 new)
++     2. [refresh] water-app                 (+180 new)
++     3. [refresh] megagym-website           (+57 new)
++     ...
++     11. [new]    Model Supermaxxing        (creates a new brain)
++     12. [new]    NATO - Social Media Scraping (creates a new brain)
++     13. [new]    Status Line               (creates a new brain)
++   ```
++
++   Parse the user's exclusions (e.g. "2,4" → drop items 2 and 4) and act on the
++   remaining list.
++
++   **DEFAULT = refresh existing brains only. Creating NEW brains is opt-in.**
++   Never auto-create a brain for a never-imported project just because it showed up
++   in the scan. List the `[new]` candidates separately and ask explicitly whether to
++   create any of them — the default if the user doesn't single them out is to leave
++   them alone. (A project having no brain yet is often deliberate; don't assume the
++   user wants it indexed.)
++
++   **Honor the user's standing exclusions.** Before showing `[new]` candidates, read
++   the master brain's exclusion list at
++   `…\brains\master\vault\07_ALL_PROJECT_BRAINS.md` under the **"Not Project Brains"**
++   heading, and drop any folder named there from the `[new]` list entirely (e.g.
++   `Status Line`, `#SOON`, `.claude`, NeuroVault repo clones). That list is the
++   user's recorded decision about what should NOT be a brain — respect it without
++   asking. The scanner already filters obvious noise; this catches the
++   user-specific ones. The numbered list + opt-in rule is the final veto chance.
++4. For each **stale brain** the user approved, re-import incrementally using its
++   recorded source from the JSON (`source`) and its `brain_id`:
++   ```bash
++   python scripts/import_project_vault.py --source "<recorded source>" \
++     --brain-id <brain_id> --name "<name>"
++   ```
++5. For each **new project** the user approved:
++   ```bash
++   python scripts/import_project_vault.py --source "<folder>" --name "<folder name>"
++   ```
++6. Summarize: which brains refreshed, which were created, totals. Re-run
++   `scan.py` (read-only) at the end if you want to show everything is now green.
++
++---
++
++## Step 4 — OPTIONAL (opt-in): sync the `master` brain
++
++`master` is the hand-curated routing/overview brain. It is NOT a clone of any
++folder, so the importer never touches it — but its inventory drifts when brains are
++added/removed/refreshed. **Only run this if the user asks** ("also update master",
++"sync the directory", "keep master in step"). Default is OFF.
++
++This is **judgment work, not copying** — run it on a capable model (Opus, or
++Sonnet at high effort), NOT the lightweight import worker. It rewrites prose-y
++inventory files, so be conservative and surgical.
++
++Files to keep in step (under `…\brains\master\vault\`):
++- `07_ALL_PROJECT_BRAINS.md` — the canonical inventory **table**
++  (`Brain id | Source | Role | Current index`) + a **"Not Project Brains"** section
++  + an `Updated: <date>` line.
++- `00_BRAIN_DIRECTORY.md` — per-brain detailed entries (Vault id, Purpose, Physical
++  location, "Use this brain for" topics, "Current import status").
++
++How to sync:
++1. Read the live `brains.json` (the authoritative brain list) and, for each project
++   brain, its `_neurovault_index\00_PROJECT_IMPORT_OVERVIEW.md` (source path, file
++   counts) and the date it was refreshed in this run.
++2. For accurate **note/chunk counts**, query the running app rather than guessing:
++   `GET http://127.0.0.1:8765/api/status` (or NeuroVault MCP `status` per brain).
++   If the app isn't reachable, update the structural facts (which brains exist,
++   sources, refresh dates) and leave counts as-is or mark them stale — do not invent
++   numbers.
++3. **Update, don't rewrite:** add rows for new brains, remove rows for deleted ones,
++   refresh sources/dates/stats. **Preserve the user's curated prose** — roles,
++   routing topics, cross-project themes, and especially the **"Not Project Brains"**
++   exclusions. Bump the `Updated:` date.
++4. **Never re-add an excluded folder.** The "Not Project Brains" list is the user's
++   standing decision (e.g. `Status Line`, `#SOON`, `.claude`, the NeuroVault repo
++   clones). Sync keeps that list; it does not delete entries from it.
++5. Show the user a diff/summary of what changed in master before/after writing.
++
++## Special case — the `thesis` brain
++
++`thesis` is mirrored from `C:\Users\steli\Desktop\PwC\uni (thesis)` by a dedicated
++script, `scripts/thesis_incremental_refresh.py`, which also converts `.docx` to
++HTML/markdown. For thesis, prefer that script over the generic importer:
++```bash
++python scripts/thesis_incremental_refresh.py
++```
++The scanner still reports thesis staleness (its source is hard-coded in scan.py),
++but route the actual refresh through the thesis script so the docx conversion runs.
++
++## Notes & gotchas
++
++- **Incremental + safe to re-run.** The importer hashes files; an up-to-date
++  project copies nothing. Running it twice is harmless.
++- **Confirm per the user's rule:** always state "Updating <X> will refresh the <X>
++  brain" before writing, in BOTH modes.
++- **Big deltas** (e.g. a project with hundreds of new files) are fine but will make
++  the app index a lot at once — mention it if the count is large.
++- **Keep scan.py's skip lists in sync** with `scripts/import_project_vault.py`
++  (SKIP_DIRS / SKIP_FILENAMES / SKIP_EXTS) so staleness counts match what the
++  importer would actually copy. They were aligned at creation.
++- **Drive letter:** everything defaults to `D:`. If the SSD mounts elsewhere, pass
++  `--nv-home <letter>:\NEURO-VAULT-STORAGE\.neurovault` to both scripts.
+diff --git a/.claude/skills/update-brain/scan.py b/.claude/skills/update-brain/scan.py
+new file mode 100644
+index 0000000..6c345ac
+--- /dev/null
++++ b/.claude/skills/update-brain/scan.py
+@@ -0,0 +1,248 @@
++"""
++scan.py -- discovery + staleness report for `/update-brain`.
++
++Read-only. Figures out, for the NeuroVault brain SSD:
++  1. Which existing brains map to which source project folder (read from each
++     brain's `_neurovault_index/00_PROJECT_IMPORT_OVERVIEW.md` "Source:" line).
++  2. How stale each mapped brain is vs its live source folder (new + changed
++     file counts), reusing the same skip rules + sha256 needs_copy logic as
++     thesis_incremental_refresh.py / _nv_staleness_check.py.
++  3. Under one or more PROJECT ROOT folders (where the user keeps all their
++     projects in File Explorer), which subfolders have NEVER been imported into
++     any brain at all.
++
++Nothing is copied or written. Output is a human report plus a machine-readable
++JSON block (after the LINE `===JSON===`) the skill can parse to decide what to
++refresh / create.
++
++Usage:
++  # Full sweep: all brains + scan these roots for never-imported projects
++  python scan.py --roots "C:\\Users\\steli\\Documents\\Claude_Projects"
++  # Multiple roots:
++  python scan.py --roots "C:\\...\\Claude_Projects" --roots "D:\\OtherProjects"
++  # Single project (is it imported? how stale?):
++  python scan.py --source "C:\\Users\\steli\\Documents\\Claude_Projects\\Makeup Game"
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import re
++import sys
++from pathlib import Path
++
++NV_HOME_DEFAULT = r"D:\NEURO-VAULT-STORAGE\.neurovault"
++
++# Skip rules MIRRORED from scripts/import_project_vault.py so staleness counts
++# reflect what the importer would actually copy. Keep these in sync if the
++# importer's lists change.
++SKIP_DIRS = {
++    ".claude", ".git", ".hg", ".svn", ".next", ".nuxt", ".turbo", ".vite",
++    ".venv", "__pycache__", "build", "cache", "coverage", "cuda_outputs",
++    "dist", "downloads", "external-repos", "node_modules", "logs",
++    "live_backups", "memory_backups", "models", "outputs", "pip_cache",
++    "release", "target", "uploads", "venv", "venv_cuda", "MegaGym-Website",
++}
++SKIP_SUFFIXES = (".neurovault.md", ".neurovault.html", ".mammoth.html")
++SKIP_FILENAMES = {
++    ".env", ".env.local", ".env.development.local", ".env.test.local",
++    ".env.production.local", ".git", ".skill-optimizer-ran", ".cache",
++    ".metadata_cache.json", "bun.lockb", "libraries.json",
++    "package-lock.json", "pnpm-lock.yaml", "transcribepro-macos-buildkit.zip",
++    "transcribepro-windows-installer.zip", "yarn.lock", "youtube_cookies.txt",
++    # Config / not project content (the dedicated thesis importer skips these too,
++    # so staleness for the thesis brain doesn't show false positives).
++    ".mcp.json",
++}
++# .bak = local backups, never project content.
++SKIP_EXTS = {".mp4", ".zip", ".bak"}
++
++# Brains that are NOT project clones (skip in staleness / never flag as new).
++NON_PROJECT_BRAINS = {"master", "default"}
++
++# Brains handled by a dedicated importer (no standard import overview).
++SPECIAL_SOURCES = {
++    "thesis": r"C:\Users\steli\Desktop\PwC\uni (thesis)",
++}
++
++# When scanning a project root for NEVER-imported folders, ignore noise:
++# dotfolders, scratch folders (#...), and the NeuroVault app repo + its
++# legacy/backup/test clones (those are the app, not a project to index).
++def is_noise_folder(name: str) -> bool:
++    low = name.lower()
++    return (
++        name.startswith(".")
++        or name.startswith("#")
++        or low.startswith("neurovault")
++    )
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with p.open("rb") as f:
++        for chunk in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def iter_source_files(root: Path):
++    files = []
++    for d, dirs, names in os.walk(root):
++        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
++        for n in names:
++            if n.startswith("~$") or n.endswith(SKIP_SUFFIXES):
++                continue
++            if n in SKIP_FILENAMES:
++                continue
++            if Path(n).suffix.lower() in SKIP_EXTS:
++                continue
++            files.append(Path(d) / n)
++    return files
++
++
++def needs_copy(src: Path, dst: Path) -> bool:
++    if not dst.exists():
++        return True
++    s, d = src.stat(), dst.stat()
++    if s.st_size == d.st_size and abs(s.st_mtime - d.st_mtime) <= 2:
++        return False
++    return sha256_file(src) != sha256_file(dst)
++
++
++def norm(p: str | Path) -> str:
++    """Normalize a path for comparison: lowercase, no trailing slash."""
++    return os.path.normcase(os.path.normpath(str(p))).rstrip("\\/")
++
++
++def brain_source(nv_home: Path, brain_id: str) -> str | None:
++    """Recorded source folder for a brain, or None if undiscoverable."""
++    if brain_id in SPECIAL_SOURCES:
++        return SPECIAL_SOURCES[brain_id]
++    ov = nv_home / "brains" / brain_id / "vault" / "_neurovault_index" / "00_PROJECT_IMPORT_OVERVIEW.md"
++    if not ov.is_file():
++        return None
++    for line in ov.read_text(encoding="utf-8", errors="replace").splitlines():
++        m = re.match(r"^Source:\s*`?(.+?)`?\s*$", line)
++        if m:
++            return m.group(1)
++    return None
++
++
++def dest_for(nv_home: Path, brain_id: str, source: str) -> Path:
++    """Where the source is mirrored inside the brain vault."""
++    return nv_home / "brains" / brain_id / "vault" / "_source_files" / Path(source).name
++
++
++def staleness(source: str, dest: Path) -> dict:
++    src_root = Path(source)
++    if not src_root.is_dir():
++        return {"source_missing": True, "new": 0, "changed": 0, "total": 0}
++    new = changed = total = 0
++    for src in iter_source_files(src_root):
++        total += 1
++        dst = dest / src.relative_to(src_root)
++        if not dst.exists():
++            new += 1
++        elif needs_copy(src, dst):
++            changed += 1
++    return {"source_missing": False, "new": new, "changed": changed, "total": total}
++
++
++def load_brains(nv_home: Path) -> list[dict]:
++    reg = nv_home / "brains.json"
++    if not reg.is_file():
++        sys.exit(f"brains.json not found under {nv_home}")
++    data = json.loads(reg.read_text(encoding="utf-8"))
++    return data.get("brains", [])
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description="Discovery + staleness for /update-brain")
++    ap.add_argument("--nv-home", default=NV_HOME_DEFAULT)
++    ap.add_argument("--roots", action="append", default=[],
++                    help="Project-root folder to scan for never-imported projects (repeatable).")
++    ap.add_argument("--source", help="Single project folder: report its brain + staleness only.")
++    args = ap.parse_args()
++
++    nv_home = Path(args.nv_home)
++    brains = load_brains(nv_home)
++
++    # brain_id -> {name, source, dest}
++    mapped: dict[str, dict] = {}
++    source_index: dict[str, str] = {}  # norm(source) -> brain_id
++    for b in brains:
++        bid = b.get("id", "")
++        if bid in NON_PROJECT_BRAINS:
++            continue
++        src = brain_source(nv_home, bid)
++        if not src:
++            continue
++        mapped[bid] = {"name": b.get("name", bid), "source": src,
++                       "dest": str(dest_for(nv_home, bid, src))}
++        source_index[norm(src)] = bid
++
++    result: dict = {"mode": None, "brains": [], "unimported": [], "single": None}
++
++    # ---- Single-project mode -------------------------------------------------
++    if args.source:
++        result["mode"] = "single"
++        src = args.source
++        bid = source_index.get(norm(src))
++        print(f"# Single project: {src}\n")
++        if bid:
++            st = staleness(src, Path(mapped[bid]["dest"]))
++            print(f"Already imported as brain '{bid}' ({mapped[bid]['name']}).")
++            print(f"  new files:     {st['new']}")
++            print(f"  changed files: {st['changed']}")
++            print(f"  total scanned: {st['total']}")
++            verdict = "UP TO DATE" if st["new"] == 0 and st["changed"] == 0 else "STALE -> refresh recommended"
++            print(f"  verdict: {verdict}")
++            result["single"] = {"brain_id": bid, **mapped[bid], "staleness": st, "imported": True}
++        else:
++            print("NOT imported into any brain yet -> would create a NEW brain.")
++            result["single"] = {"brain_id": None, "source": src, "imported": False}
++        _emit_json(result)
++        return 0
++
++    # ---- Full sweep ----------------------------------------------------------
++    result["mode"] = "full"
++    print("# Brains mapped to a source folder\n")
++    for bid, info in sorted(mapped.items()):
++        st = staleness(info["source"], Path(info["dest"]))
++        flag = ("MISSING SRC" if st["source_missing"]
++                else "up to date" if st["new"] == 0 and st["changed"] == 0
++                else f"STALE (+{st['new']} new, ~{st['changed']} changed)")
++        print(f"  {bid:<40} {flag}")
++        result["brains"].append({"brain_id": bid, **info, "staleness": st})
++
++    # Never-imported projects under the given roots.
++    if args.roots:
++        print("\n# Never-imported project folders under scanned roots\n")
++        for root in args.roots:
++            rp = Path(root)
++            if not rp.is_dir():
++                print(f"  (root not found: {root})")
++                continue
++            for child in sorted(p for p in rp.iterdir() if p.is_dir()):
++                if norm(child) in source_index:
++                    continue
++                if is_noise_folder(child.name):
++                    continue
++                print(f"  NEW: {child}")
++                result["unimported"].append({"name": child.name, "source": str(child)})
++        if not result["unimported"]:
++            print("  (none -- every project folder already has a brain)")
++
++    _emit_json(result)
++    return 0
++
++
++def _emit_json(result: dict) -> None:
++    print("\n===JSON===")
++    print(json.dumps(result, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/.claude/skills/update-neurovault-app/SKILL.md b/.claude/skills/update-neurovault-app/SKILL.md
+new file mode 100644
+index 0000000..34dda82
+--- /dev/null
++++ b/.claude/skills/update-neurovault-app/SKILL.md
+@@ -0,0 +1,206 @@
++---
++name: update-neurovault-app
++description: >
++  Update the NeuroVault APPLICATION (this code checkout) to a newer upstream
++  release WITHOUT losing the user's local add-ons (SSD eject button, auto-open
++  watcher, loading splash, mmap release fix, graph tweaks, etc.). Uses a rolling
++  one-deep backup: snapshot the current state, rebase the local add-ons onto the
++  new release, then delete the PREVIOUS update's backup. Windows-first. Invoke
++  when the user says "update NeuroVault", "update the app", "there's a new
++  version", "update to vX.Y.Z", or similar. NOTE: updates app code/binary only —
++  refreshing a project's CONTENT into its brain on the SSD is a separate
++  cloning/indexing workflow, not this skill.
++---
++
++# Update the NeuroVault app, keep my tweaks
++
++This repo is a **fork-with-local-tweaks**. `origin` is the upstream NeuroVault repo
++(`github.com/sirdath/NeuroVault`). The user works on a branch named
++`custom/v<NN>-with-local-tweaks` that carries a handful of personal commits on top
++of an upstream release tag, plus some **uncommitted** working-tree tweaks.
++
++The update model the user wants (their words): **"backup → update (passing any
++tweaks I've made) → delete the old backup."** It's a rolling one-deep safety net:
++always keep the snapshot from *this* update, delete the snapshot from the *previous*
++one.
++
++> Do the phases in order. Phases 1–2 are git surgery — show the user what you're
++> about to delete before you delete it. Phase 3 is the build gotcha that bit us
++> last time. Phase 4 proves it actually runs.
++
++---
++
++## Phase 0 — Survey (read-only, no changes)
++
++```bash
++git fetch origin --tags
++node -p "require('./package.json').version"     # CURRENT version, e.g. 0.5.2
++git branch                                       # find custom/v*-with-local-tweaks + any backup
++git tag | sort -V | grep '^v' | tail -5          # newest upstream tags
++git log origin/main..HEAD --oneline              # OUR custom commits (the ones to carry)
++git status --short                               # uncommitted local tweaks to carry too
++```
++
++Establish four facts and state them back to the user before touching anything:
++- **CURRENT_VER** — from `package.json` (e.g. `0.5.2`).
++- **TARGET_TAG** — the release to move to. Use the newest `v*` tag unless the user
++  named one. Confirm it's actually newer than CURRENT_VER.
++- **OUR_COMMITS** — `git log origin/main..HEAD` = the personal commits to replay.
++- **OLD_BACKUP** — any existing `custom/*backup*` / `custom/*working*` branch. This
++  is the one Phase 1 deletes.
++
++If `git status` shows uncommitted tweaks, they're intentional (the user hand-edits
++files like `index.html`, `src-tauri/src/lib.rs`, `src/App.tsx`). They get carried
++via stash in Phase 2 — do **not** discard them.
++
++---
++
++## Phase 1 — Backup, and rotate out the previous backup
++
++```bash
++# Snapshot the CURRENT pre-update state (commits only; uncommitted tweaks are
++# carried separately in Phase 2, but commit-state is what a revert needs).
++TODAY=$(date +%Y%m%d)
++git branch custom/v${CURRENT_VER//./}-backup-$TODAY        # e.g. custom/v052-backup-20260612
++```
++
++Then **delete the previous backup** — but show it first:
++
++```bash
++git branch | grep -iE 'backup|working'      # confirm which is OLD vs the one just made
++git branch -D <OLD_BACKUP>                   # e.g. custom/v041-backup-20260612
++```
++
++Invariant after this phase: exactly **one** backup branch exists — the one made just
++now. If the user has uncommitted tweaks they care about that are NOT yet a commit,
++mention that the backup branch only captures committed state; the working-tree
++copy is still on disk and gets carried in Phase 2.
++
++---
++
++## Phase 2 — Carry the tweaks onto the new release
++
++```bash
++git stash push -u -m "local tweaks before $TARGET_TAG"   # set aside uncommitted tweaks
++git rebase $TARGET_TAG                                     # replay OUR_COMMITS onto the new release
++```
++
++**Rebase conflict policy** — the upstream delta is large (last time: 126 files).
++When a conflict hits one of our commits, **keep our addition and re-apply upstream's
++surrounding changes around it**. Our changes are additive (a new button, a new Rust
++command, a new pragma) — they should slot in next to upstream's, not replace them.
++After resolving: `git add <files>` then `git rebase --continue`.
++
++Then restore the uncommitted tweaks:
++
++```bash
++git stash pop          # may conflict — resolve per the rules below
++```
++
++`stash pop` conflict rules (these are the exact cases we hit):
++- **Content conflict in a file we both changed** (e.g. `src/App.tsx`): keep BOTH —
++  our additions (Eject button) *and* upstream's new markup (window-mode menu). Take
++  the stashed side for our hunk, keep upstream's for theirs.
++- **modify/delete where upstream DELETED the file** (e.g.
++  `src-tauri/gen/schemas/capabilities.json` — an auto-generated artifact): accept the
++  deletion → `git rm <file>`. Don't resurrect generated files.
++- After resolving everything: `git add -A`, then `git stash drop`.
++
++Finally, rename the working branch to the new version:
++
++```bash
++git branch -m custom/v${CURRENT_VER//./}-with-local-tweaks custom/v${TARGET_TAG_DIGITS}-with-local-tweaks
++```
++
++Sanity check: `git log --oneline -6` — OUR_COMMITS should sit directly on top of the
++TARGET_TAG release commit.
++
++---
++
++## Phase 3 — Stage the sidecar (REQUIRED since v0.5.x, or the build won't even check)
++
++v0.5.x bundles `neurovault-server` as a Tauri **sidecar** (`externalBin`). The crate's
++`build.rs` validates that binary exists on **every** compile — including `cargo check`
++and `tauri dev` — so a fresh checkout fails with:
++
++```
++resource path `binaries\neurovault-server-<triple>.exe` doesn't exist
++```
++
++Stage it once (the helper does the `TAURI_CONFIG` escape-hatch build + copy):
++
++```powershell
++pwsh -File .claude/skills/update-neurovault/stage-sidecar-dev.ps1
++```
++
++Then verify the Rust side compiles:
++
++```bash
++cd src-tauri && cargo check        # expect: Finished, no errors
++```
++
++`src-tauri/binaries/` is gitignored — the staged binary is a build artifact, never
++committed.
++
++---
++
++## Phase 4 — Launch and verify it actually runs
++
++**Kill any stale `neurovault.exe` first** — a leftover process locks
++`target\debug\neurovault.exe` and the rebuild dies with `Access is denied (os error 5)`:
++
++```powershell
++Get-Process neurovault -ErrorAction SilentlyContinue | Stop-Process -Force
++```
++
++**Launch.** If the SSD brain is plugged in, prefer the real launcher
++`Start-NeuroVault-SSD.cmd` (it sets `NEUROVAULT_HOME` with the *quoted* `set "VAR=val"`
++form — important, see gotcha below). Launch with **separate** redirect files via
++`Start-Process` — do NOT use `cmd /c "script.cmd > log"`, the in-cmd redirect gets
++mangled and no log appears:
++
++```powershell
++$out="$env:LOCALAPPDATA\NeuroVault\devrun.log"; $err="$env:LOCALAPPDATA\NeuroVault\devrun.err.log"
++$env:NEUROVAULT_HOME="D:\NEURO-VAULT-STORAGE\.neurovault"   # only if launching npx directly
++Start-Process npx.cmd -ArgumentList "tauri","dev" `
++  -WorkingDirectory "<repo>" -RedirectStandardOutput $out -RedirectStandardError $err `
++  -WindowStyle Hidden -PassThru
++```
++
++**Verify** (all three should pass):
++- `Get-Process neurovault | Select MainWindowHandle` → non-zero (window is up).
++- `Invoke-WebRequest http://127.0.0.1:8765/api/status` → HTTP 200 (backend alive;
++  note `/status`, `/brains` etc. are 404 — `/api/status` is the real route).
++- stderr log contains `vault watcher started for brain <id>` — and `<id>` matches the
++  active brain in the SSD's `brains.json` (proves it read the SSD, not the C: fallback).
++
++---
++
++## Phase 5 — Report
++
++Tell the user:
++- New working branch: `custom/v<NEW>-with-local-tweaks` (= release + their commits).
++- Backup kept: `custom/v<CURRENT>-backup-<date>` (one revert away:
++  `git checkout custom/v<CURRENT>-backup-<date>`).
++- Old backup deleted: `<OLD_BACKUP>`.
++- Which add-ons survived (eject button/command, watcher, splash, mmap fix, graph tweaks).
++- Anything new the release adds that they'll notice.
++
++If anything failed verification, say so plainly and offer the one-line revert above —
++do **not** claim success on a build you didn't see run.
++
++---
++
++## Gotchas log (things that bit us on the v0.4.1 → v0.5.2 update)
++
++- **Trailing-space env var.** `cmd /c "... && set NEUROVAULT_HOME=D:\..\.neurovault && .."`
++  (unquoted) captures the space before `&&` *into the value* → path `…\.neurovault `
++  → "system cannot find the path" panic at `vault_dir()`. Fixed in source with
++  `.trim()` on the env var, and the launcher `.cmd` uses the quoted `set "VAR=val"`
++  form. If you ever set it inline, use the quoted form.
++- **Sidecar not staged** → build.rs check fails before any compile (Phase 3).
++- **Stale neurovault.exe** → `Access is denied` removing the exe on rebuild (Phase 4).
++- **In-cmd redirect** (`cmd /c "x > log"`) → no log file created; use `Start-Process`
++  `-RedirectStandardOutput/-Error` instead.
++- **Auto-generated files in conflicts** (`gen/schemas/capabilities.json`): accept
++  upstream's deletion, don't resurrect.
+diff --git a/.claude/skills/update-neurovault-app/stage-sidecar-dev.ps1 b/.claude/skills/update-neurovault-app/stage-sidecar-dev.ps1
+new file mode 100644
+index 0000000..1607928
+--- /dev/null
++++ b/.claude/skills/update-neurovault-app/stage-sidecar-dev.ps1
+@@ -0,0 +1,66 @@
++<#
++  stage-sidecar-dev.ps1
++  ---------------------
++  Stage the `neurovault-server` MCP sidecar binary for a DEV build.
++
++  Why this is needed: since v0.5.x the app crate's build.rs (tauri_build)
++  validates that the externalBin `binaries/neurovault-server-<triple>[.exe]`
++  exists on EVERY compile of the crate -- including `cargo check` and
++  `tauri dev`. A fresh checkout has no such binary, so the build fails with:
++      resource path `binaries\neurovault-server-<triple>.exe` doesn't exist
++
++  The escape hatch (same trick as scripts/stage-sidecar.mjs, but debug):
++  build `neurovault-server` with TAURI_CONFIG overriding externalBin to []
++  so its own build.rs check is disabled, then copy the produced binary into
++  src-tauri/binaries/ where the app build expects it.
++
++  This is a build artifact -- src-tauri/binaries/ is gitignored. Re-run it
++  after a clean, after an upstream bump, or whenever cargo complains the
++  resource path doesn't exist.
++
++  Usage:  pwsh -File .claude/skills/update-neurovault/stage-sidecar-dev.ps1
++          (optional)  -Release   # stage from a release build instead of debug
++#>
++param([switch]$Release)
++
++$ErrorActionPreference = 'Stop'
++
++# Repo root = two levels up from this script (.claude/skills/update-neurovault/).
++$repo    = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
++$srcTauri = Join-Path $repo 'src-tauri'
++
++# Host target triple, e.g. x86_64-pc-windows-msvc.
++$hostLine = (& rustc -vV) | Where-Object { $_ -like 'host:*' }
++if (-not $hostLine) { throw 'could not determine host triple from `rustc -vV`' }
++$triple = $hostLine.Substring('host:'.Length).Trim()
++$exe = if ($triple -like '*windows*') { '.exe' } else { '' }
++$profile = if ($Release) { 'release' } else { 'debug' }
++
++Write-Host "[stage-sidecar-dev] building neurovault-server ($profile) for $triple (externalBin check disabled)"
++
++# Build the sidecar with externalBin removed from the effective config so its
++# build.rs does not require the very binary we are producing.
++$prevTauriConfig = $env:TAURI_CONFIG
++$env:TAURI_CONFIG = '{"bundle":{"externalBin":[]}}'
++try {
++    Push-Location $srcTauri
++    $cargoArgs = @('build', '--bin', 'neurovault-server')
++    if ($Release) { $cargoArgs += '--release' }
++    & cargo @cargoArgs
++    if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
++} finally {
++    Pop-Location
++    $env:TAURI_CONFIG = $prevTauriConfig
++}
++
++$built = Join-Path $srcTauri "target\$profile\neurovault-server$exe"
++if (-not (Test-Path $built)) { throw "built sidecar not found at $built" }
++
++$outDir = Join-Path $srcTauri 'binaries'
++New-Item -ItemType Directory -Force -Path $outDir | Out-Null
++$dest = Join-Path $outDir "neurovault-server-$triple$exe"
++Copy-Item $built $dest -Force
++
++$mb = '{0:N1}' -f ((Get-Item $dest).Length / 1MB)
++Write-Host "[stage-sidecar-dev] staged -> $dest ($mb MB)"
++Write-Host "[stage-sidecar-dev] done. You can now run: cd src-tauri; cargo check"
+diff --git a/index.html b/index.html
+index 3f06eb5..b9380b6 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,8 @@
+     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>NeuroVault</title>
++    <!-- reload -->
++
+   </head>
+   <body>
+     <div id="root"></div>
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index 52d5afc..4d15f4b 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -49,8 +49,10 @@
+     "dialog:default",
+     "dialog:allow-open",
+     "dialog:allow-save",
++    "dialog:allow-ask",
+     "deep-link:default",
+     "updater:default",
+-    "process:allow-restart"
++    "process:allow-restart",
++    "process:allow-exit"
+   ]
+ }
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 2c50c9f..db6f653 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -1397,6 +1397,75 @@ fn nv_stop_vault_watcher(brain_id: Option<String>) -> std::result::Result<(), St
+     Ok(())
+ }
+ 
++/// Safely flush + eject the external SSD that hosts the brain vault.
++///
++/// The SSD is the user's organized clone of source material that also
++/// lives on C:, so no off-drive copy is made — the eject just ensures
++/// the on-disk database is consistent, then releases the drive.
++///
++/// Steps, in order:
++///   1. Stop all vault watchers (release file handles, stop mid-writes).
++///   2. WAL-checkpoint every open brain so `brain.db` is fully written.
++///   3. Drop all cached DB handles (unmaps the mmap, closes the files).
++///   4. Spawn a DETACHED helper that waits for this app process to exit
++///      and then issues the Windows "safely remove" eject on the drive,
++///      retrying a few times. The caller (frontend) quits the app right
++///      after this returns, so the helper ejects once every handle is
++///      gone — the only reliable way given SQLite's 256 MiB mmap.
++///
++/// Returns a human-readable summary the UI can toast. Errors leave the
++/// drive un-ejected; the data is still flushed and safe on the SSD.
++#[tauri::command]
++fn nv_eject_ssd_brain() -> std::result::Result<String, String> {
++    let home = nv_home();
++    let home_str = home.to_string_lossy().to_string();
++    // Drive letter like "D:" from the brain-home path prefix.
++    let drive = if home_str.len() >= 2 && home_str.as_bytes()[1] == b':' {
++        home_str[..2].to_uppercase()
++    } else {
++        return Err("Could not determine the SSD drive letter from the brain home path.".to_string());
++    };
++    if drive == "C:" {
++        return Err("The active brain is on the system drive (C:), not a removable SSD — nothing to eject.".to_string());
++    }
++
++    // 1. Trigger the pre-registered "NeuroVault-Eject" scheduled task. A
++    //    task runs independently of this app's process tree, so it SURVIVES
++    //    the app closing — a spawned child gets killed the moment the app
++    //    exits, which is why an inline helper never finished. The task also
++    //    runs elevated, so the device-eject of the Fixed-type USB SSD isn't
++    //    blocked. Its script (Eject-NeuroVaultSSD.ps1) waits for this app to
++    //    exit, then safely removes the drive via CM_Request_Device_Eject
++    //    (which PRESERVES the drive letter for replug) and re-arms the
++    //    auto-open watcher. Trigger BEFORE touching the DB so a missing-task
++    //    failure aborts with no side effects. The task itself waits for our
++    //    exit, so starting it now is safe.
++    #[cfg(windows)]
++    {
++        use std::os::windows::process::CommandExt;
++        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++        let status = std::process::Command::new("schtasks")
++            .args(["/Run", "/TN", "NeuroVault-Eject"])
++            .creation_flags(CREATE_NO_WINDOW)
++            .status()
++            .map_err(|e| format!("Could not start the eject task: {e}"))?;
++        if !status.success() {
++            return Err(
++                "Eject task isn't registered — run Register-NeuroVault-Eject.ps1 once.".to_string(),
++            );
++        }
++    }
++
++    // 2. Stop watchers so nothing writes during the checkpoint.
++    memory::watcher::stop_all();
++    // 3. Flush every open brain's WAL into brain.db.
++    memory::db::checkpoint_all();
++    // 4. Release all DB handles (unmap mmap, close brain.db).
++    memory::db::close_all();
++
++    Ok(format!("Flushed. Safely removing {drive} once NeuroVault closes."))
++}
++
+ // The Python-as-subprocess bridge (`run_python_job` + `python -m
+ // neurovault_server <job>`) was removed 2026-05-16 when the Python
+ // server package was deleted. The Rust backend now covers every
+@@ -1637,6 +1706,8 @@ pub fn run() {
+             // brain activation; the Tauri commands are here for
+             // debug/manual control from Settings.
+             nv_start_vault_watcher, nv_stop_vault_watcher,
++            // Safely flush + back up + eject the external SSD hosting the brain.
++            nv_eject_ssd_brain,
+             // Drop-folder inbox: UI file-drop copies raw files into the
+             // brain inbox for the connected agent to turn into notes.
+             nv_inbox_add, nv_inbox_list,
+diff --git a/src/App.tsx b/src/App.tsx
+index 0e2d801..c1e0267 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -87,6 +87,11 @@ export default function App() {
+   const [serverDown, setServerDown] = useState(false);
+   const [serverUp, setServerUp] = useState(false);
+   const [noteCount, setNoteCount] = useState(0);
++  // "Safe to eject" tracking: the brain is busy whenever its index is
++  // still changing (files being copied/ingested/embedded/linked). When
++  // the counts hold steady across a poll, it's idle = safe to eject.
++  const [ejectBusy, setEjectBusy] = useState(false);
++  const activityRef = useRef<{ fp: number; stable: number }>({ fp: -1, stable: 0 });
+   const [starting, setStarting] = useState(false);
+   const [startElapsed, setStartElapsed] = useState(0);
+   const failCountRef = useRef(0);
+@@ -239,7 +244,21 @@ export default function App() {
+           // Best-effort stats — absent an active brain this 500s, but the
+           // server is still up, so don't let it flip the connected dot.
+           fetchStatus()
+-            .then((s) => setNoteCount(s.memories))
++            .then((s) => {
++              setNoteCount(s.memories);
++              // Fingerprint the index. While anything is being passed into
++              // the brain these move; when they stop, the brain is idle.
++              const fp = s.memories + s.chunks + s.connections + s.entities;
++              const a = activityRef.current;
++              if (fp !== a.fp) {
++                a.fp = fp;
++                a.stable = 0;
++                setEjectBusy(true);
++              } else {
++                a.stable += 1;
++                if (a.stable >= 1) setEjectBusy(false);
++              }
++            })
+             .catch(() => {});
+         })
+         .catch(() => {
+@@ -736,8 +755,50 @@ export default function App() {
+               {serverUp ? "connected" : "offline"}
+             </span>
+           </div>
+-          {/* Window mode — minimise / hide / shrink-to-widget. Replaces the
+-              old single hide button; opens a small menu (ContextMenu). */}
++          {/* Eject SSD Brain — flush + back up + safely remove the external
++              SSD that hosts the brain, then close the app. */}
++          <button
++            onClick={async () => {
++              try {
++                const { ask } = await import("@tauri-apps/plugin-dialog");
++                const busyWarn = ejectBusy
++                  ? "⚠ The brain is still indexing — items being added right now may not make it in (your source files stay safe). Wait for the dot to turn green for a clean eject.\n\n"
++                  : "";
++                const ok = await ask(
++                  `${busyWarn}This flushes the brain so brain.db is fully written, then safely ejects the SSD and closes NeuroVault.\n\nThe brain stays unavailable until you replug the drive and reopen the app.`,
++                  { title: "Eject SSD Brain", kind: "warning", okLabel: "Eject & Close", cancelLabel: "Cancel" },
++                );
++                if (!ok) return;
++                toast.info("Flushing the brain…");
++                const { invoke } = await import("@tauri-apps/api/core");
++                const msg = await invoke<string>("nv_eject_ssd_brain");
++                toast.success(`${msg} Closing now — unplug once the drive disappears from Explorer.`);
++                const { exit } = await import("@tauri-apps/plugin-process");
++                window.setTimeout(() => { void exit(0); }, 1800);
++              } catch (e) {
++                toast.error(`Eject failed: ${e}. Your data is flushed & safe — use Windows "Safely Remove Hardware".`);
++              }
++            }}
++            title={ejectBusy
++              ? "Indexing in progress — wait for the dot to turn green before ejecting"
++              : "Safe to eject — flush and safely remove the SSD (closes the app)"}
++            className="flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-md transition-colors"
++            style={{ color: theme.textMuted, background: "transparent", border: `1px solid ${theme.border}` }}
++            onMouseEnter={(e) => { e.currentTarget.style.background = `${theme.negative}1a`; e.currentTarget.style.color = theme.negative; e.currentTarget.style.borderColor = `${theme.negative}55`; }}
++            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = theme.textMuted; e.currentTarget.style.borderColor = theme.border; }}
++          >
++            <span
++              className={`w-1.5 h-1.5 rounded-full flex-shrink-0${ejectBusy ? " animate-pulse" : ""}`}
++              style={ejectBusy
++                ? { backgroundColor: theme.accent }
++                : { backgroundColor: theme.positive, boxShadow: `0 0 6px ${theme.positive}66` }}
++            />
++            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
++              <path d="M12 4 5 13h14L12 4Z" />
++              <path d="M6 17h12" />
++            </svg>
++            {ejectBusy ? "Indexing…" : "Eject SSD Brain"}
++          </button>
+           <button
+             ref={winTriggerRef}
+             onClick={() => (winMenu ? setWinMenu(null) : openWinMenu())}
+diff --git a/src/components/GraphFilterPanel.tsx b/src/components/GraphFilterPanel.tsx
+index 98cb615..2774ee7 100644
+--- a/src/components/GraphFilterPanel.tsx
++++ b/src/components/GraphFilterPanel.tsx
+@@ -386,6 +386,15 @@ export function GraphFilterPanel({
+             onChange={s.setAnimations}
+             hint="Off freezes the 3D particle flow and skips the bloom glow pass — saves GPU, especially in the 3D view."
+           />
++          <Slider
++            label="3D Node Glow"
++            value={s.bloomStrength}
++            min={0}
++            max={1.5}
++            step={0.05}
++            onChange={s.setBloomStrength}
++            formatter={(v) => (v === 0 ? "off" : v.toFixed(2))}
++          />
+           <div className="space-y-2">
+             <div
+               className="text-[11px] font-[Geist,sans-serif]"
+diff --git a/src/components/NeuralGraph.tsx b/src/components/NeuralGraph.tsx
+index 6d30cc3..01a38ea 100644
+--- a/src/components/NeuralGraph.tsx
++++ b/src/components/NeuralGraph.tsx
+@@ -320,9 +320,15 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+   const fg2dRef = useRef<unknown>(undefined);
+   const bloomAttachedRef = useRef(false);
+   const clusterAttachedRef = useRef(false);
++  // Holds the live UnrealBloomPass so the "3D Node Glow" slider can tweak
++  // its strength without re-attaching (which would reset the composer).
++  const bloomPassRef = useRef<{ strength: number } | undefined>(undefined);
+   // Declared early (before the bloom effect below references it) to avoid
+   // a temporal-dead-zone error in the effect's dependency array.
+   const animations = useGraphSettingsStore((s) => s.animations);
++  // User-controlled bloom intensity ("3D Node Glow" in Filters). Declared
++  // early for the same TDZ reason as `animations`.
++  const bloomStrength = useGraphSettingsStore((s) => s.bloomStrength);
+   // Live snapshot the d3-force collide+link callbacks read on every
+   // tick. Keeping it in a ref avoids re-attaching the forces (which
+   // would restart the simulation) every time analytics state flips.
+@@ -358,11 +364,13 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+       // bloom knobs (threshold 0.85 ≈ only bright colors bloom).
+       const pass = new UnrealBloomPass(
+         new Vector2(size.w, size.h),
+-        0.9, // strength
+-        0.6, // radius
+-        0.1, // threshold (low so most bright colors contribute)
++        bloomStrength, // strength — user-controlled via "3D Node Glow" slider
++        0.4, // radius
++        0.6, // threshold — only genuinely bright nodes bloom, so a dense
++        // hairball of overlapping nodes doesn't accumulate into a white supernova
+       );
+       composer.addPass(pass);
++      bloomPassRef.current = pass;
+       bloomAttachedRef.current = true;
+     };
+     // The ref isn't populated synchronously when Suspense resolves, so
+@@ -379,12 +387,22 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+   // Clearing the flag on mode-switch so bloom re-attaches if the user
+   // toggles 3D → 2D → 3D (the composer is a fresh instance each time).
+   useEffect(() => {
+-    if (mode === "2d") bloomAttachedRef.current = false;
++    if (mode === "2d") {
++      bloomAttachedRef.current = false;
++      bloomPassRef.current = undefined;
++    }
+     // Same story for the cluster force — re-mounted ForceGraph instance
+     // means a fresh d3-force graph with no custom forces attached.
+     clusterAttachedRef.current = false;
+   }, [mode]);
+ 
++  // Live-update bloom intensity when the "3D Node Glow" slider moves —
++  // mutate the existing pass in place so the composer isn't rebuilt.
++  useEffect(() => {
++    if (mode !== "3d") return;
++    if (bloomPassRef.current) bloomPassRef.current.strength = bloomStrength;
++  }, [mode, bloomStrength]);
++
+   // Install the folder-cluster force + tighter charge/collide tuning
+   // on the 2D graph's d3-force sim. Default force-graph parameters
+   // are tuned for ~100 nodes; at 250+ nodes with 30k+ edges the
+@@ -513,6 +531,46 @@ export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+   const nodeShape = useGraphSettingsStore((s) => s.nodeShape);
+   const graphBackgroundColor = useGraphSettingsStore((s) => s.graphBackgroundColor);
+   const showClusterLabels = useGraphSettingsStore((s) => s.showClusterLabels);
++
++  // Force the 3D scene + WebGL clear colour to the user's chosen
++  // graphBackgroundColor (the same value the 2D container uses). The
++  // ForceGraph3D `backgroundColor` prop alone doesn't reliably stick in
++  // this three/runtime combo — it falls back to a white clear colour,
++  // washing the whole scene out. Setting scene.background + the renderer
++  // clear colour imperatively makes 3D match 2D. Re-applies on colour
++  // change and retries until the lazy ForceGraph3D ref is populated.
++  // (Declared here, after graphBackgroundColor, to avoid a TDZ access.)
++  useEffect(() => {
++    if (mode !== "3d") return;
++    let cancelled = false;
++    let applied = false;
++    let id = 0;
++    const apply = async () => {
++      if (applied) return;
++      const fg = fg3dRef.current as {
++        scene?: () => { background: unknown } | undefined;
++        renderer?: () => { setClearColor: (c: unknown, a?: number) => void } | undefined;
++      } | undefined;
++      if (!fg?.scene || !fg?.renderer) return;
++      const THREE = await import("three");
++      if (cancelled) return;
++      const color = new THREE.Color(graphBackgroundColor);
++      const scene = fg.scene();
++      if (scene) scene.background = color;
++      const renderer = fg.renderer();
++      if (renderer) renderer.setClearColor(color, 1);
++      applied = true;
++      window.clearInterval(id);
++    };
++    // Same retry pattern as the bloom pass — the ref isn't populated
++    // synchronously when Suspense resolves.
++    id = window.setInterval(apply, 150);
++    apply();
++    return () => {
++      cancelled = true;
++      window.clearInterval(id);
++    };
++  }, [mode, graphBackgroundColor]);
+   // User colour overrides — folder name → hex, cluster name → hex.
+   // Selecting individually so a change to one doesn't rerender the
+   // other consumer.
+diff --git a/src/stores/graphSettingsStore.ts b/src/stores/graphSettingsStore.ts
+index 685de3e..9ed705a 100644
+--- a/src/stores/graphSettingsStore.ts
++++ b/src/stores/graphSettingsStore.ts
+@@ -191,6 +191,10 @@ interface GraphSettings {
+   /** Master animation toggle. When false: 3D bloom + link particles are
+    *  disabled and 2D cools down fast — saves GPU/CPU. Default true. */
+   animations: boolean;
++  /** UnrealBloomPass strength in the 3D view ("3D Node Glow" in Filters).
++   *  0 = no glow, ~0.35 default (gentle), higher = brighter. Capped at 1.5
++   *  so a dense cluster can't blow out to a white supernova. */
++  bloomStrength: number;
+   /** Cluster-background style: "soft" circles (default) or "hull"
+    *  convex-hull polygons (venn-diagram look, one colour per category). */
+   groupingStyle: GraphGroupingStyle;
+@@ -227,6 +231,7 @@ const DEFAULTS: GraphSettings = {
+   timelapseSpeedSec: 15,
+   spread: 0.5,
+   animations: true,
++  bloomStrength: 0.35,
+   groupingStyle: "soft",
+ };
+ 
+@@ -296,6 +301,7 @@ function load(): GraphSettings {
+         timelapseSpeedSec: num("timelapseSpeedSec", 15, 3, 90),
+         spread: num("spread", 0.5, 0, 1),
+         animations: bool("animations", true),
++        bloomStrength: num("bloomStrength", 0.35, 0, 1.5),
+         groupingStyle: parsed.groupingStyle === "hull" ? "hull" : "soft",
+       };
+     }
+@@ -337,6 +343,7 @@ interface GraphSettingsStore extends GraphSettings {
+   setSpread: (v: number) => void;
+   setAnimations: (v: boolean) => void;
+   toggleAnimations: () => void;
++  setBloomStrength: (v: number) => void;
+   setGroupingStyle: (v: GraphGroupingStyle) => void;
+ }
+ 
+@@ -447,5 +454,6 @@ export const useGraphSettingsStore = create<GraphSettingsStore>((set, get) => ({
+   },
+   setAnimations: (animations) => { set({ animations }); persist({ ...get(), animations }); },
+   toggleAnimations: () => { const next = !get().animations; set({ animations: next }); persist({ ...get(), animations: next }); },
++  setBloomStrength: (bloomStrength) => { set({ bloomStrength }); persist({ ...get(), bloomStrength }); },
+   setGroupingStyle: (groupingStyle) => { set({ groupingStyle }); persist({ ...get(), groupingStyle }); },
+ }));
+-- 
+2.53.0.windows.2
+
