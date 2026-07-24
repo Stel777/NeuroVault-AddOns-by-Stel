@@ -1,0 +1,230 @@
+From 5e265213fe4a3b5e182a738df433e23214ae3aa2 Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 00:41:44 +0300
+Subject: [PATCH] fix(window): recover a closed window, and make X quit the app
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closing the main window with X destroys it, while the hidden minitab
+window keeps the event loop alive — so the app ran on with no window.
+Every restore path was guarded by `get_webview_window("main")` and
+silently no-oped once that returned None, leaving the app reachable only
+by killing the process. That invisible process also held brain.db and
+SQLite's 256 MiB mmap open, so Windows refused to eject the external SSD
+hosting the vault ("drive in use") with nothing on screen to explain it.
+
+- restore_or_create_main() rebuilds the window from the tauri.conf.json
+  entry labelled `main` when it no longer exists. Shared by the minitab's
+  "Open app" button, single-instance (exe double-click + deep links), the
+  global shortcut, and macOS Reopen. The rebuild runs on a spawned thread
+  because build() deadlocks WebView2 on Windows when called from a
+  synchronous command or an event handler (wry#583) — which three of the
+  four callers are.
+- CloseRequested on the main window now exits the app, and ExitRequested
+  checkpoints every open brain's WAL and drops the DB handles, so the
+  drive is free the moment the process is. "Shrink to widget" is
+  unaffected: it hides the window rather than closing it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src-tauri/src/lib.rs | 139 +++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 113 insertions(+), 26 deletions(-)
+
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index db6f653..3333e70 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -872,15 +872,57 @@ fn minimize_main(app: tauri::AppHandle) -> Result<(), String> {
+     Ok(())
+ }
+ 
+-/// Bring the full app window to the front — the minitab's "Open app" button.
+-#[tauri::command]
+-fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
++/// Bring the main window back — recreating it if it no longer exists.
++///
++/// Closing the window with the titlebar X *destroys* it; Tauri does not hide
++/// it. The app survives because the minitab window keeps the event loop alive,
++/// but `get_webview_window("main")` returns `None` from then on, so every
++/// restore path (this one, the global shortcut, the single-instance handler,
++/// macOS Reopen) used to silently no-op — the app was running, unreachable,
++/// and only a restart brought it back. Rebuild from the same `tauri.conf.json`
++/// entry the app booted with so size/title/theme live in one place.
++///
++/// The rebuild runs on a spawned thread because creating a window on the main
++/// thread deadlocks WebView2 on Windows when called from a synchronous command
++/// or an event handler (wry#583) — which is exactly what every caller here is.
++/// Restoring an existing window is cheap and stays inline.
++fn restore_or_create_main(app: &tauri::AppHandle) {
+     use tauri::Manager;
+     if let Some(w) = app.get_webview_window("main") {
+         let _ = w.unminimize();
+-        w.show().map_err(|e| format!("show main: {e}"))?;
++        let _ = w.show();
+         let _ = w.set_focus();
++        return;
+     }
++    let app = app.clone();
++    std::thread::spawn(move || {
++        let config = app
++            .config()
++            .app
++            .windows
++            .iter()
++            .find(|w| w.label == "main")
++            .cloned();
++        let Some(config) = config else {
++            eprintln!("[neurovault] no 'main' window config to rebuild from");
++            return;
++        };
++        // A racing caller may have rebuilt it already, in which case `build()`
++        // fails on the duplicate label — log and move on rather than fight it.
++        match tauri::WebviewWindowBuilder::from_config(&app, &config).and_then(|b| b.build()) {
++            Ok(w) => {
++                let _ = w.set_focus();
++                eprintln!("[neurovault] main window had been closed — rebuilt it");
++            }
++            Err(e) => eprintln!("[neurovault] could not rebuild main window: {e}"),
++        }
++    });
++}
++
++/// Bring the full app window to the front — the minitab's "Open app" button.
++#[tauri::command]
++fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
++    restore_or_create_main(&app);
+     Ok(())
+ }
+ 
+@@ -1501,17 +1543,16 @@ pub fn run() {
+         // exits the new one. The deep-link plugin below then picks
+         // up the forwarded URL and emits it to the frontend.
+         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+-            // Bring the existing window to the front so the user
+-            // doesn't stare at nothing after clicking a URL. The
+-            // actual URL handling is done by the deep-link plugin's
+-            // `on_open_url` callback, which single-instance triggers
+-            // when it sees a URL arg in argv.
+-            use tauri::Manager;
+-            if let Some(window) = app.get_webview_window("main") {
+-                let _ = window.unminimize();
+-                let _ = window.show();
+-                let _ = window.set_focus();
+-            }
++            // Bring the window to the front so the user doesn't stare
++            // at nothing after clicking a URL — or after double-clicking
++            // the exe, which lands here too once an instance is running.
++            // Recreates the window if it was closed. The actual URL
++            // handling is done by the deep-link plugin's `on_open_url`
++            // callback, which single-instance triggers when it sees a
++            // URL arg in argv. (A rebuild is asynchronous, so a deep
++            // link arriving in that gap can outrun the new frontend's
++            // listener; the URL is then dropped rather than routed.)
++            restore_or_create_main(app);
+             // Log once so a user staring at stderr knows the URL
+             // round-tripped; the frontend will emit a second log
+             // when it acts on it.
+@@ -1543,11 +1584,9 @@ pub fn run() {
+                     // Bring the main window to the front + focus, then
+                     // emit the event. The frontend listens for it and
+                     // opens the overlay regardless of current view.
+-                    if let Some(window) = app.get_webview_window("main") {
+-                        let _ = window.unminimize();
+-                        let _ = window.show();
+-                        let _ = window.set_focus();
+-                    }
++                    // Recreates the window if it was closed, which makes
++                    // this the universal "get NeuroVault back" gesture.
++                    restore_or_create_main(app);
+                     // Also re-summon the floating minitab if it was hidden.
+                     // This is the recovery path for the minitab's "hide"
+                     // (eye) button — the shortcut is the universal "bring
+@@ -1564,6 +1603,26 @@ pub fn run() {
+                 })
+                 .build(),
+         )
++        // Closing the main window with X quits NeuroVault outright.
++        //
++        // Tauri's default is to destroy only that window, and the app kept
++        // running afterwards because the (hidden) minitab window holds the
++        // event loop open. That left an invisible process owning brain.db —
++        // including SQLite's 256 MiB mmap — so when the vault lives on an
++        // external SSD, Windows refused to eject the drive ("still in use")
++        // with nothing on screen to explain why. The DB flush + handle
++        // release happens in the ExitRequested handler this triggers.
++        //
++        // "Shrink to widget" is unaffected: it *hides* the main window
++        // rather than closing it, so it never raises CloseRequested and
++        // still parks the app in the minitab.
++        .on_window_event(|window, event| {
++            use tauri::Manager;
++            if window.label() == "main" && matches!(event, tauri::WindowEvent::CloseRequested { .. })
++            {
++                window.app_handle().exit(0);
++            }
++        })
+         .setup(move |app| {
+             // Register the shortcut at startup. If another app already owns
+             // the combo we log and move on — the in-app Ctrl+Shift+Space
+@@ -1737,6 +1796,15 @@ pub fn run() {
+                     // background listener on Windows can keep the process
+                     // alive for a few seconds after the main window closes.
+                     memory::watcher::stop_all();
++                    // Then leave the drive hosting the vault genuinely free:
++                    // flush each brain's WAL into brain.db and drop the
++                    // 256 MiB mmap + file handles. Same order the eject path
++                    // uses (watchers → checkpoint → close). Quitting is how
++                    // the user releases an external SSD for a manual
++                    // "safely remove", so the handles must be gone the
++                    // moment the process is.
++                    memory::db::checkpoint_all();
++                    memory::db::close_all();
+                 }
+                 // macOS only: clicking the Dock icon while no window is on
+                 // screen — after a native minimise, or after
+@@ -1744,16 +1812,35 @@ pub fn run() {
+                 // window can't be brought back from the Dock, so minimising
+                 // "traps" the app on macOS. (Windows restores from the taskbar
+                 // natively, which is why this only bit macOS.) Bring the main
+-                // window back: unminimise + show + focus.
++                // window back: unminimise + show + focus, recreating it if it
++                // was closed.
+                 #[cfg(target_os = "macos")]
+                 tauri::RunEvent::Reopen { .. } => {
+-                    if let Some(window) = app.get_webview_window("main") {
+-                        let _ = window.unminimize();
+-                        let _ = window.show();
+-                        let _ = window.set_focus();
+-                    }
++                    restore_or_create_main(app);
+                 }
+                 _ => {}
+             }
+         });
+ }
++
++#[cfg(test)]
++mod tests {
++    /// `restore_or_create_main` rebuilds the closed window from the
++    /// `tauri.conf.json` entry labelled `main`. Renaming or dropping that entry
++    /// would put the label lookup back to `None` and make the rebuild a silent
++    /// no-op — reintroducing the "app runs but no window can be opened" bug —
++    /// and nothing in the type system would catch it. Pin the label here.
++    #[test]
++    fn tauri_conf_defines_a_main_window() {
++        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
++            .expect("tauri.conf.json parses");
++        let windows = conf["app"]["windows"]
++            .as_array()
++            .expect("tauri.conf.json has an app.windows array");
++        assert!(
++            windows.iter().any(|w| w["label"] == "main"),
++            "tauri.conf.json must define a window labelled `main` — \
++             restore_or_create_main() rebuilds the closed window from it"
++        );
++    }
++}
+-- 
+2.53.0.windows.2
+

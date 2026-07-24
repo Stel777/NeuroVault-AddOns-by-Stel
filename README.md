@@ -30,6 +30,7 @@ tweaks, and an install script that applies them onto a clean checkout.
 | 0009 | **Source folders: shared `_source_files/` layout** | The in‑app Sync writes the **same** vault layout as `/update-brain`, so the two reconcile instead of duplicating. |
 | 0010 | **Source folders: "Full import (code)" button** | Runs `/update-brain`'s own importer so the in‑app Sync imports **all** file types (code/binary → `.neurovault.md` sidecars), not just markdown. Needs Python. |
 | 0011 | **UI: theme vars on `:root`** | Fixes portaled modals (the Source Folders panel) rendering transparent. |
+| 0012 | **Window: recoverable close + X quits the app** | Closing the window used to destroy it while the app kept running invisibly, with every "reopen" path silently doing nothing — the app was only reachable by killing the process, and it held the brain DB open so an external SSD couldn't be ejected. Now the window is rebuilt if it's missing, and **X quits the app**, flushing each brain's WAL and releasing the drive on the way out. |
 | — | **`local-tweaks/`** | Uncommitted local edits: `src-tauri/src/lib.rs` tweaks, refinements to the `update-brain` skill, and the `_nv_staleness_check.py` helper. |
 
 ---
@@ -58,7 +59,7 @@ bash   /path/to/neurovault-addons-by-stel/apply.sh
 ```
 
 The installer:
-1. `git am -3 patches/*.patch` — replays the 11 add‑on commits.
+1. `git am -3 patches/*.patch` — replays the 12 add‑on commits.
 2. `git apply --3way local-tweaks/local-tweaks.diff` — applies the local tweaks.
 3. Copies `local-tweaks/scripts/_nv_staleness_check.py` into `scripts/`.
 
