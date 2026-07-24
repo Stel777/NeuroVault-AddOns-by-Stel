@@ -21,6 +21,8 @@ git apply --3way "$here\local-tweaks\local-tweaks.diff"
 
 $dst = "scripts"
 if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst | Out-Null }
-Copy-Item "$here\local-tweaks\scripts\_nv_staleness_check.py" "$dst\_nv_staleness_check.py" -Force
+# Copy every helper in local-tweaks\scripts\, so dropping a new one in
+# there is enough to ship it — this script never needs editing again.
+Copy-Item "$here\local-tweaks\scripts\*.py" $dst -Force
 
 Write-Host "`nDone. Build with:  npm install ; npm run tauri dev" -ForegroundColor Green
