@@ -1,45 +1,43 @@
 # NeuroVault add-ons by Stel
 
-Extra features layered on top of upstream **[NeuroVault](https://github.com/sirdath/NeuroVault)**.
-If you already run stock NeuroVault, apply these patches to get everything in
-Stel's build — SSD workflow, a static graph mode, per‑brain source folders with
-full `/update-brain` parity, and more.
+Local add-ons layered on top of upstream **[NeuroVault](https://github.com/sirdath/NeuroVault)**.
+Delivered as a **patch set** (not a fork): `git format-patch` files plus a small
+install script that replays them onto a clean checkout.
 
-These are delivered as a **patch set** (not a fork): a series of
-`git format-patch` files plus a small diff for a couple of uncommitted local
-tweaks, and an install script that applies them onto a clean checkout.
-
-> Base: the patches apply on top of upstream commit **`a9d5628`** (the v0.5.2
-> line — "delete retired Python MCP proxy"). The install script uses 3‑way
-> apply so they still land cleanly on nearby revisions.
+> Base: these patches apply on top of upstream **`v0.6.0`**.
+> The install script uses 3-way apply so they still land on nearby revisions.
 
 ---
 
 ## What's included
 
-| # | Add‑on | What it does |
+| # | Add-on | What it does |
 |---|--------|--------------|
-| 0001 | **Preserve local customizations** | Baseline local tweaks (launcher, build settings, etc.). |
-| 0002 | **SSD: auto‑open + loading splash** | When the external SSD with your brains is plugged in, NeuroVault auto‑opens with a loading splash. |
-| 0003 | **SSD: reliable eject + loading ring** | A dependable eject button and an asymptotic loading ring. |
-| 0004 | **Skills: `update-brain` + `update-neurovault-app`** | Two Claude‑Code skills: refresh project content into a brain on the SSD; and update the app to a new upstream release without losing these add‑ons. |
-| 0005 | **Sortable brain list/grid** | Sort your vaults by name / date / note count. |
-| 0006 | **Static graph mode + per‑brain source folders** | A third **Static** graph view (frozen layout, no physics — low CPU); and per‑brain configurable source folders that the brain mirrors. |
-| 0007 | **Source folders: ignore build dirs + race fix** | Skips `node_modules`/`.git`/`dist`/build/cache dirs; tolerates the watcher ingest race. |
-| 0008 | **Source folders: dry‑run preview + dedup** | "Sync" previews exactly what it will add/update/remove/skip before applying, and skips content already in the brain. |
-| 0009 | **Source folders: shared `_source_files/` layout** | The in‑app Sync writes the **same** vault layout as `/update-brain`, so the two reconcile instead of duplicating. |
-| 0010 | **Source folders: "Full import (code)" button** | Runs `/update-brain`'s own importer so the in‑app Sync imports **all** file types (code/binary → `.neurovault.md` sidecars), not just markdown. Needs Python. |
-| 0011 | **UI: theme vars on `:root`** | Fixes portaled modals (the Source Folders panel) rendering transparent. |
-| 0012 | **Window: recoverable close + X quits the app** | Closing the window used to destroy it while the app kept running invisibly, with every "reopen" path silently doing nothing — the app was only reachable by killing the process, and it held the brain DB open so an external SSD couldn't be ejected. Now the window is rebuilt if it's missing, and **X quits the app**, flushing each brain's WAL and releasing the drive on the way out. |
-| — | **`local-tweaks/`** | Uncommitted local edits: the `Start-NeuroVault-SSD.cmd` launcher (starts the installed standalone app, so it needs no Vite/Node), `nv_home()` env-var trimming in `src-tauri/src/lib.rs`, refinements to the `update-brain` skill, `import_project_vault.py`, and the `_nv_staleness_check.py` + `clean_brain_index.py` helpers. |
+| 0001 | **SSD brain workflow** | Finds the brain store on an external SSD by its `NEURO-VAULT-STORAGE\.neurovault\brains.json` marker instead of a hardcoded drive letter, so the app, `neurovault-server` and the MCP forwarder all follow the drive wherever it mounts. Adds the **Eject SSD Brain** button + `nv_eject_ssd_brain` (flush WAL, drop the mmap, hand off to an elevated eject task). Makes **closing the window quit the app** so the drive is actually released. Ships the launcher, auto-open watcher, loading splash, eject/registration scripts, the `update-brain` + `update-neurovault-app` Claude skills, and the python vault helpers. |
+| 0002 | **"Full import (code)" button** | Runs the `/update-brain` importer over every configured source folder, so **all** file types come into the vault (code/html/binary become `.neurovault.md` sidecars) rather than markdown only. Needs Python on PATH. Complements upstream's "Index code", which reads code *structure* into the graph without importing the files. |
 
----
+### Why this set is so much smaller than the v0.5.2 one
+
+Upstream **absorbed most of the old add-ons** in v0.6.0, so they are no longer
+carried here:
+
+| previously a local patch | status in v0.6.0 |
+|---|---|
+| per-brain source folders, ignore build dirs, `_source_files` layout, dry-run preview | shipped upstream (`446847f`) |
+| sortable brain list / grid | shipped upstream |
+| static graph mode | absorbed — upstream's `2d`/`3d` are pinned-coordinate snapshots with no physics loop |
+| theme vars mirrored to `:root` | fixed upstream in `applyThemeToDocument` |
+| WAL checkpoint + close DBs on exit | implemented upstream, explicitly for unmounting an external drive |
+| window-rebuild fix (closed window could not be reopened) | unnecessary — upstream prevents the close that destroyed the window |
+
+There is no longer a `local-tweaks/` directory: everything is a real commit.
 
 ## Requirements
 
 - A NeuroVault source checkout (git).
 - **Node + Rust** to build the app (same as upstream).
-- **Python 3** — only for the "Full import (code)" button and the `update-brain` skill (same dependency they've always had).
+- **Python 3** — only for the "Full import (code)" button and the `update-brain`
+  skill (same dependency they have always had).
 
 ## How to apply
 
@@ -49,7 +47,7 @@ git clone https://github.com/sirdath/NeuroVault.git
 cd NeuroVault
 
 # 2. (recommended) start from the base these patches target
-git checkout a9d5628    # or stay on your branch; the scripts use 3-way apply
+git checkout v0.6.0        # or stay on your branch; the scripts use 3-way apply
 
 # 3. From inside the NeuroVault checkout, run the installer from this repo:
 #    Windows:
@@ -58,17 +56,19 @@ pwsh -File /path/to/neurovault-addons-by-stel/apply.ps1
 bash   /path/to/neurovault-addons-by-stel/apply.sh
 ```
 
-The installer:
-1. `git am -3 patches/*.patch` — replays the 12 add‑on commits.
-2. `git apply --3way local-tweaks/local-tweaks.diff` — applies the local tweaks.
-3. Copies `local-tweaks/scripts/*.py` into `scripts/`.
+The installer replays the add-on commits with `git am -3`.
 
-Then build as usual: `npm install && npm run tauri dev` (or `tauri build`).
+Then build as usual: `npm install && npm run tauri build`.
 
 If a patch conflicts (because upstream moved), resolve it, `git add -A`, and
 `git am --continue`.
 
+> **Do not use the in-app "Update to vX" button.** It installs the stock
+> upstream binary over your build, which silently removes every add-on above —
+> the first symptom is an empty brain, because SSD detection is one of them.
+> Update the source checkout and rebuild instead.
+
 ---
 
-*Generated from Stel's `custom/v052-with-local-tweaks` branch. Not affiliated
-with the upstream project; provided as‑is.*
+*Generated from Stel's `custom/v060-with-local-tweaks` branch. Not affiliated
+with the upstream project; provided as-is.*

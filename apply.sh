@@ -17,13 +17,9 @@ if ! git am -3 "$here"/patches/*.patch; then
   exit 1
 fi
 
-echo "Applying local tweaks..."
-git apply --3way "$here/local-tweaks/local-tweaks.diff"
-
-mkdir -p scripts
-# Copy every helper in local-tweaks/scripts/, so dropping a new one in
-# there is enough to ship it — this script never needs editing again.
-cp "$here"/local-tweaks/scripts/*.py scripts/
+# No local-tweaks step any more: as of the v0.6.0 rebase every add-on is a
+# real commit, so the patches above carry the launcher, the skills and the
+# python helpers too.
 
 echo
-echo "Done. Build with:  npm install && npm run tauri dev"
+echo "Done. Build with:  npm install && npm run tauri build"

@@ -1,0 +1,3144 @@
+From 12a5487776889ae826febe2b16d0a2f25d0a9cb9 Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 15:13:13 +0300
+Subject: [PATCH 1/2] feat(ssd): port the SSD brain workflow onto v0.6.0
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+v0.6.0 moved every desktop concern out of lib.rs into app.rs behind the
+`gui` feature, so the local add-ons had to be re-targeted rather than
+rebased. Upstream had meanwhile absorbed the source-folders work
+(source_mirror.rs, BrainSourcesPanel, dry-run SyncPlan, sortable brain
+list) and independently implemented the WAL-checkpoint-on-exit this
+setup needs, so only the genuinely local pieces are carried here.
+
+- paths.rs: nv_home() now falls back to a plugged-in SSD, located by its
+  NEURO-VAULT-STORAGE\.neurovault\brains.json marker rather than by drive
+  letter. Placed in paths (not the desktop layer) so neurovault-server
+  and the MCP forwarder resolve the same brains. Env vars are trimmed —
+  `set VAR=D:\... &&` captures the trailing space into the value.
+- app.rs: nv_eject_ssd_brain triggers the elevated NeuroVault-Eject task,
+  stops watchers, checkpoints every WAL and drops the mmap + handles.
+- app.rs: closing the main window QUITS instead of hiding (upstream's
+  default). A hidden-but-running app holds brain.db and a 256 MiB mmap
+  open, so Windows refuses to eject the SSD. This reuses upstream's own
+  save-then-quit handshake, so a failed save still reopens the window
+  with the retained buffer instead of losing data.
+- App.tsx: Eject SSD Brain button, with an index-activity probe that
+  warns while ingest is still moving. Quits via quit_after_save, since
+  ExitRequested swallows a raw exit(0).
+- Restores the launcher, watcher, splash, eject and registration scripts,
+  the Claude skills, and the python vault helpers.
+
+Not carried: the 0.5.2 window-rebuild fix is unnecessary here — upstream
+prevents the close that destroyed the window, so it can no longer happen.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .claude/skills/update-brain/SKILL.md          | 317 ++++++++++
+ .claude/skills/update-brain/scan.py           | 297 +++++++++
+ .claude/skills/update-neurovault-app/SKILL.md | 206 ++++++
+ .../stage-sidecar-dev.ps1                     |  66 ++
+ Eject-NeuroVaultSSD.ps1                       |  89 +++
+ Register-NeuroVault-AutoOpen.ps1              |  47 ++
+ Register-NeuroVault-Eject.ps1                 |  48 ++
+ Show-NeuroVault-Splash.ps1                    | 230 +++++++
+ Start-NeuroVault-SSD.cmd                      |  44 ++
+ Watch-NeuroVault-SSD.ps1                      |  90 +++
+ scripts/_nv_staleness_check.py                |  61 ++
+ scripts/clean_brain_index.py                  | 141 +++++
+ scripts/import_project_vault.py               | 592 ++++++++++++++++++
+ scripts/thesis_incremental_refresh.py         | 181 ++++++
+ src-tauri/capabilities/default.json           |   4 +-
+ src-tauri/src/app.rs                          | 124 ++--
+ src-tauri/src/memory/paths.rs                 |  44 +-
+ src-tauri/src/memory/project_import.rs        | 209 +++++++
+ src/App.tsx                                   |  84 +++
+ 19 files changed, 2837 insertions(+), 37 deletions(-)
+ create mode 100644 .claude/skills/update-brain/SKILL.md
+ create mode 100644 .claude/skills/update-brain/scan.py
+ create mode 100644 .claude/skills/update-neurovault-app/SKILL.md
+ create mode 100644 .claude/skills/update-neurovault-app/stage-sidecar-dev.ps1
+ create mode 100644 Eject-NeuroVaultSSD.ps1
+ create mode 100644 Register-NeuroVault-AutoOpen.ps1
+ create mode 100644 Register-NeuroVault-Eject.ps1
+ create mode 100644 Show-NeuroVault-Splash.ps1
+ create mode 100644 Start-NeuroVault-SSD.cmd
+ create mode 100644 Watch-NeuroVault-SSD.ps1
+ create mode 100644 scripts/_nv_staleness_check.py
+ create mode 100644 scripts/clean_brain_index.py
+ create mode 100644 scripts/import_project_vault.py
+ create mode 100644 scripts/thesis_incremental_refresh.py
+ create mode 100644 src-tauri/src/memory/project_import.rs
+
+diff --git a/.claude/skills/update-brain/SKILL.md b/.claude/skills/update-brain/SKILL.md
+new file mode 100644
+index 0000000..feb51c7
+--- /dev/null
++++ b/.claude/skills/update-brain/SKILL.md
+@@ -0,0 +1,317 @@
++---
++name: update-brain
++description: >
++  Refresh project CONTENT into NeuroVault brains on the SSD (the brain at
++  D:\NEURO-VAULT-STORAGE\.neurovault). Clones + incrementally re-indexes a
++  project's working folder into its matching brain, and can discover projects
++  that were never imported at all. Two modes: FULL (sweep every brain + scan
++  project-root folders for never-imported projects) or PROJECT (just the one
++  the user is working on). Always shows a read-only staleness report and asks
++  for confirmation before writing. Invoke when the user says "update the brain",
++  "update brain", "refresh my project in the brain", "index this project",
++  "did this project get passed to the brain", or similar. This is CONTENT/data,
++  NOT the app code — updating the app is /update-neurovault-app.
++---
++
++# Update brain (refresh project content into the SSD brains)
++
++The user keeps their projects in working folders (mostly under
++`C:\Users\steli\Documents\Claude_Projects\<Project>`) and mirrors each one into a
++matching **brain** on the SSD (`D:\NEURO-VAULT-STORAGE\.neurovault\brains\<id>\`).
++The mirror is done by `scripts/import_project_vault.py`, which copies the real
++source (skipping `node_modules`, `dist`, `target`, media, lockfiles, etc.),
++writes markdown sidecars NeuroVault indexes, and registers the brain in
++`brains.json`. Re-running it is **incremental** — sha256 means only changed files
++are touched.
++
++This skill wraps that into a safe, confirmed workflow. **Read-only first, write
++only after the user okays it.**
++
++**A complete run delivers TWO things — treat them as two checkboxes you must close
++before declaring success:**
++1. **Backed up** — the project's files mirrored into the brain on the SSD.
++2. **Indexed** — the app has actually ingested those files (notes + chunks > 0).
++
++The import only does #1. #2 is a separate, async step that **does not always start
++on its own**, so this skill explicitly triggers and verifies it (Step 3.5). Never
++end a run with "backed up" alone and leave the user to ask you to start/watch
++indexing — close both boxes yourself.
++
++## Model — run it on Sonnet, escalate to Opus only if genuinely stuck
++
++This is a mechanical task — run a script, copy/convert files, report. It does NOT
++need Opus-level reasoning. Run it **automatically on Sonnet**:
++
++1. The orchestrator (whatever model the session is on) handles the **interactive**
++   parts: pick mode, run the read-only `scan.py`, show the staleness report, and
++   get the user's scope confirmation (which stale brains to refresh, which
++   never-imported projects to create).
++2. Dispatch the **execution** (the actual `import_project_vault.py` /
++   `thesis_incremental_refresh.py` runs) to a **Sonnet subagent** via the Agent
++   tool (`subagent_type: general-purpose`, `model: sonnet`). Give it the explicit,
++   already-approved list of `(source, brain_id, name)` imports so it doesn't need
++   to re-ask anything. It runs them, captures each JSON summary, and reports back.
++3. **Escalate to Opus only if the Sonnet subagent hits something genuinely hard** —
++   a script crash it can't diagnose, an encoding/parse failure, an ambiguous
++   brain↔source mapping. It should STOP and report the problem rather than guess;
++   the orchestrator then either handles it directly or spawns an Opus subagent for
++   that one item. Routine imports should never need this.
++
++In short: **Sonnet does the work, Opus is the break-glass.** The user has approved
++this delegation pattern explicitly.
++
++## Preconditions
++
++- The SSD must be plugged in. Verify `D:\NEURO-VAULT-STORAGE\.neurovault\brains.json`
++  exists (if the drive mounts as another letter, pass `--nv-home <letter>:\...`).
++- `python` available (3.10+). The two tools used:
++  - `.claude/skills/update-brain/scan.py` — read-only discovery + staleness.
++  - `scripts/import_project_vault.py` — the actual copy/index (writes).
++- Keep the app running so indexing can happen — but do NOT rely on the vault
++  watcher alone. It often misses a bulk import (a new brain can sit at 0 notes),
++  so Step 3.5 explicitly triggers indexing via the HTTP API and verifies it.
++
++## Step 1 — Pick the mode
++
++Ask the user (AskUserQuestion) **FULL or PROJECT**:
++- **FULL** — sweep every brain for staleness AND scan project-root folder(s) for
++  projects that were never imported.
++- **PROJECT** — just refresh the single project the user is working on (default to
++  the current working directory's project, but confirm the folder).
++
++---
++
++## Step 2 (PROJECT mode) — one project
++
++1. Determine the project folder. Default guess: the repo/folder the user is in;
++   otherwise ask for the path.
++2. Read-only staleness:
++   ```bash
++   python .claude/skills/update-brain/scan.py --source "<project folder>"
++   ```
++   Parse the `===JSON===` block. It tells you `imported` (bool), the `brain_id`,
++   and `staleness` (`new`, `changed`, `total`).
++3. **Confirm before writing**, naming the project explicitly, e.g.:
++   > "Updating **Makeup Game** will refresh the **makeup-game** brain on the SSD
++   > (+0 new, ~3 changed). Proceed?"
++   - If `imported` is false, say it will **create a new brain** instead.
++   - If `new == 0 and changed == 0`, tell them it's already up to date and ask
++     whether to run anyway (usually no).
++4. On confirmation, import (incremental):
++   ```bash
++   python scripts/import_project_vault.py --source "<project folder>" \
++     --brain-id <brain_id> --name "<Project Name>"
++   ```
++   - For a **new** project omit `--brain-id` (it derives one) and set `--name`.
++   - Add `--active` only if the user wants to switch the app to that brain now.
++5. Report what changed (the importer prints a JSON summary: files copied,
++   converted, etc.).
++6. **Index & verify (Step 3.5)** — trigger indexing and confirm it actually
++   finished (the second checkbox). Do not hand this to the user to babysit.
++7. **Then offer the master sync (Step 4)** — proactively ask: "Want me to sync the
++   **master** brain too?" Do NOT write to master unless the user says yes; do NOT
++   silently skip the offer.
++
++---
++
++## Step 3 (FULL mode) — sweep + discover
++
++1. Decide which **project-root folders** to scan for never-imported projects.
++   Default root: `C:\Users\steli\Documents\Claude_Projects`. Ask if the user wants
++   to add more roots (multiple `--roots` allowed — e.g. another drive/folder where
++   projects live). Pass each as a separate `--roots`.
++2. Read-only full report:
++   ```bash
++   python .claude/skills/update-brain/scan.py \
++     --roots "C:\Users\steli\Documents\Claude_Projects"
++   # add: --roots "<another root>" ... as needed
++   ```
++   Show the user the human-readable section: which brains are `up to date` vs
++   `STALE (+N new, ~M changed)`, and the `NEW:` never-imported folders. Parse the
++   `===JSON===` block for the actionable lists (`brains[]`, `unimported[]`).
++3. **Confirm scope before writing — show a NUMBERED LIST and let the user exclude.**
++   Present every candidate action as one flat numbered list, stale-refreshes and
++   new-brain-creations together, each line tagged so the user can see which is which.
++   Then ask which numbers to EXCLUDE (the default is "do all of them"). Example:
++
++   ```
++   These projects will be passed into the brain. Tell me any numbers to SKIP
++   (e.g. "2, 4 no"), or just say go to do them all:
++     1. [refresh] ds2                       (+353 new)
++     2. [refresh] water-app                 (+180 new)
++     3. [refresh] megagym-website           (+57 new)
++     ...
++     11. [new]    Model Supermaxxing        (creates a new brain)
++     12. [new]    NATO - Social Media Scraping (creates a new brain)
++     13. [new]    Status Line               (creates a new brain)
++   ```
++
++   Parse the user's exclusions (e.g. "2,4" → drop items 2 and 4) and act on the
++   remaining list.
++
++   **DEFAULT = refresh existing brains only. Creating NEW brains is opt-in.**
++   Never auto-create a brain for a never-imported project just because it showed up
++   in the scan. List the `[new]` candidates separately and ask explicitly whether to
++   create any of them — the default if the user doesn't single them out is to leave
++   them alone. (A project having no brain yet is often deliberate; don't assume the
++   user wants it indexed.)
++
++   **Honor the user's standing exclusions.** Before showing `[new]` candidates, read
++   the master brain's exclusion list at
++   `…\brains\master\vault\07_ALL_PROJECT_BRAINS.md` under the **"Not Project Brains"**
++   heading, and drop any folder named there from the `[new]` list entirely (e.g.
++   `Status Line`, `#SOON`, `.claude`, NeuroVault repo clones). That list is the
++   user's recorded decision about what should NOT be a brain — respect it without
++   asking. The scanner already filters obvious noise; this catches the
++   user-specific ones. The numbered list + opt-in rule is the final veto chance.
++4. For each **stale brain** the user approved, re-import incrementally using its
++   recorded source from the JSON (`source`) and its `brain_id`:
++   ```bash
++   python scripts/import_project_vault.py --source "<recorded source>" \
++     --brain-id <brain_id> --name "<name>"
++   ```
++5. For each **new project** the user approved:
++   ```bash
++   python scripts/import_project_vault.py --source "<folder>" --name "<folder name>"
++   ```
++6. Summarize: which brains refreshed, which were created, totals. Re-run
++   `scan.py` (read-only) at the end if you want to show everything is now green.
++7. **Index & verify (Step 3.5)** — for each brain you imported/created, trigger
++   indexing and confirm it finished (the second checkbox).
++8. **Then offer the master sync (Step 4)** — proactively ask "Want me to sync the
++   **master** brain too?" Do NOT write to master unless the user says yes; do NOT
++   silently skip the offer.
++
++---
++
++## Step 3.5 — Make sure it's INDEXED (the second checkbox)
++
++A successful import only writes files to disk — it does **not** guarantee the app
++has indexed them. The vault watcher frequently does not auto-ingest a bulk import,
++so a freshly created brain often sits at **0 notes / 0 chunks**. After EVERY import
++(both modes), explicitly trigger indexing and verify it completed. Do not hand this
++back to the user to babysit.
++
++For each brain you imported or created in this run:
++
++1. **Trigger ingest** (don't wait on the watcher):
++   ```bash
++   curl -s -X POST http://127.0.0.1:8765/api/update \
++     -H "Content-Type: application/json" -d '{"brain":"<brain_id>"}'
++   ```
++   `/api/update` walks the brain's vault, ingests new/changed files, and
++   soft-deletes ones removed from disk. **A client-side timeout is NOT a failure:**
++   for a large brain the curl can time out while the server keeps indexing.
++   Verify with stats (next), never by the curl exit code.
++
++2. **Poll until the count stabilizes** (indexing is async). Use the per-brain stats
++   endpoint so it works no matter which brain is active:
++   ```bash
++   curl -s http://127.0.0.1:8765/api/brains/<brain_id>/stats
++   # -> {"note_count":N,"db_bytes":...}
++   ```
++   If the brain is the ACTIVE one, `GET /api/status` also gives live
++   `chunks`/`entities`/`connections`. Run the poll as a **background loop** (do NOT
++   chain long foreground sleeps — the shell blocks them): read every ~4s and treat
++   it as done when the count is non-zero and unchanged across ~4 consecutive reads.
++
++3. **Report the second checkbox:** "Indexed ✅ — N notes, M chunks". If it never
++   moves off 0 after the trigger, say so plainly — do not claim success.
++
++If the app is NOT running (`GET /api/health` unreachable), you cannot index now:
++tell the user the files are safely on the SSD and will index the next time
++NeuroVault runs with that brain active. That is the only case where the second
++checkbox is legitimately deferred.
++
++**Final report for the run, per brain:**
++- **Backed up ✅** — files mirrored to the SSD
++- **Indexed ✅** — N notes / M chunks (or "deferred — app not running")
++
++---
++
++## Step 4 — Offer after every backup: sync the `master` brain
++
++`master` is the hand-curated routing/overview brain. It is NOT a clone of any
++folder, so the importer never touches it — but its inventory drifts when brains are
++added/removed/refreshed. **After every backup/import, proactively ask the user
++whether to sync it** — e.g. "Want me to sync the master brain too?" — and run it
++only on their **yes**. Never write to master automatically, and never silently skip
++the offer. (The user can also request it directly anytime: "also update master",
++"sync the directory", "keep master in step".)
++
++This is **judgment work, not copying** — run it on a capable model (Opus, or
++Sonnet at high effort), NOT the lightweight import worker. It rewrites prose-y
++inventory files, so be conservative and surgical.
++
++Files to keep in step (under `…\brains\master\vault\`):
++- `07_ALL_PROJECT_BRAINS.md` — the canonical inventory **table**
++  (`Brain id | Source | Role | Current index`) + a **"Not Project Brains"** section
++  + an `Updated: <date>` line.
++- `00_BRAIN_DIRECTORY.md` — per-brain detailed entries (Vault id, Purpose, Physical
++  location, "Use this brain for" topics, "Current import status").
++
++How to sync:
++1. Read the live `brains.json` (the authoritative brain list) and, for each project
++   brain, its `_neurovault_index\00_PROJECT_IMPORT_OVERVIEW.md` (source path, file
++   counts) and the date it was refreshed in this run.
++2. For accurate **note/chunk counts**, query the running app rather than guessing:
++   `GET http://127.0.0.1:8765/api/status` (or NeuroVault MCP `status` per brain).
++   If the app isn't reachable, update the structural facts (which brains exist,
++   sources, refresh dates) and leave counts as-is or mark them stale — do not invent
++   numbers.
++3. **Update, don't rewrite:** add rows for new brains, remove rows for deleted ones,
++   refresh sources/dates/stats. **Preserve the user's curated prose** — roles,
++   routing topics, cross-project themes, and especially the **"Not Project Brains"**
++   exclusions. Bump the `Updated:` date.
++4. **Never re-add an excluded folder.** The "Not Project Brains" list is the user's
++   standing decision (e.g. `Status Line`, `#SOON`, `.claude`, the NeuroVault repo
++   clones). Sync keeps that list; it does not delete entries from it.
++5. Show the user a diff/summary of what changed in master before/after writing.
++
++## Special case — the `thesis` brain
++
++`thesis` is mirrored from `C:\Users\steli\Desktop\PwC\uni (thesis)` by a dedicated
++script, `scripts/thesis_incremental_refresh.py`, which also converts `.docx` to
++HTML/markdown. For thesis, prefer that script over the generic importer:
++```bash
++python scripts/thesis_incremental_refresh.py
++```
++The scanner still reports thesis staleness (its source is hard-coded in scan.py),
++but route the actual refresh through the thesis script so the docx conversion runs.
++
++## Multi-source brains (one brain fed from several folders)
++
++A few brains are intentionally fed from **more than one source folder** (the same
++project living in two places). The importer writes each source into its own
++`_source_files\<folder name>` subfolder, so multiple sources **coexist** in one
++brain without clobbering. BUT the importer rewrites the single `Source:` line in
++`00_PROJECT_IMPORT_OVERVIEW.md` on every run, so the scanner would otherwise only
++"remember" the last-imported folder — and mis-flag the others as never-imported.
++
++These brains are registered in `scan.py`'s `MULTI_SOURCE` map (the authoritative
++list of which folders feed which brain). To refresh one, run the importer **once
++per listed source**, all with the same `--brain-id`:
++
++```bash
++python scripts/import_project_vault.py --source "<folder A>" --brain-id <id> --name "<Name>"
++python scripts/import_project_vault.py --source "<folder B>" --brain-id <id> --name "<Name>"
++```
++
++Current multi-source brains:
++- **`makeup-game`** ← both `C:\Users\steli\Documents\Claude_Projects\Makeup Game`
++  **and** `C:\Users\steli\Documents\Codex_GPT\Makeup Game - Codex` (same project, two
++  working folders; the user will eventually merge them — keep both indexed until then).
++
++## Notes & gotchas
++
++- **Incremental + safe to re-run.** The importer hashes files; an up-to-date
++  project copies nothing. Running it twice is harmless.
++- **Confirm per the user's rule:** always state "Updating <X> will refresh the <X>
++  brain" before writing, in BOTH modes.
++- **Big deltas** (e.g. a project with hundreds of new files) are fine but will make
++  the app index a lot at once — mention it if the count is large.
++- **Keep scan.py's skip lists in sync** with `scripts/import_project_vault.py`
++  (SKIP_DIRS / SKIP_FILENAMES / SKIP_EXTS) so staleness counts match what the
++  importer would actually copy. They were aligned at creation.
++- **Drive letter:** everything defaults to `D:`. If the SSD mounts elsewhere, pass
++  `--nv-home <letter>:\NEURO-VAULT-STORAGE\.neurovault` to both scripts.
+diff --git a/.claude/skills/update-brain/scan.py b/.claude/skills/update-brain/scan.py
+new file mode 100644
+index 0000000..078b2c2
+--- /dev/null
++++ b/.claude/skills/update-brain/scan.py
+@@ -0,0 +1,297 @@
++"""
++scan.py -- discovery + staleness report for `/update-brain`.
++
++Read-only. Figures out, for the NeuroVault brain SSD:
++  1. Which existing brains map to which source project folder (read from each
++     brain's `_neurovault_index/00_PROJECT_IMPORT_OVERVIEW.md` "Source:" line).
++  2. How stale each mapped brain is vs its live source folder (new + changed
++     file counts), reusing the same skip rules + sha256 needs_copy logic as
++     thesis_incremental_refresh.py / _nv_staleness_check.py.
++  3. Under one or more PROJECT ROOT folders (where the user keeps all their
++     projects in File Explorer), which subfolders have NEVER been imported into
++     any brain at all.
++
++Nothing is copied or written. Output is a human report plus a machine-readable
++JSON block (after the LINE `===JSON===`) the skill can parse to decide what to
++refresh / create.
++
++Usage:
++  # Full sweep: all brains + scan these roots for never-imported projects
++  python scan.py --roots "C:\\Users\\steli\\Documents\\Claude_Projects"
++  # Multiple roots:
++  python scan.py --roots "C:\\...\\Claude_Projects" --roots "D:\\OtherProjects"
++  # Single project (is it imported? how stale?):
++  python scan.py --source "C:\\Users\\steli\\Documents\\Claude_Projects\\Makeup Game"
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import re
++import sys
++from pathlib import Path
++
++NV_HOME_DEFAULT = r"D:\NEURO-VAULT-STORAGE\.neurovault"
++
++# Skip rules MIRRORED from scripts/import_project_vault.py so staleness counts
++# reflect what the importer would actually copy. Keep these in sync if the
++# importer's lists change.
++SKIP_DIRS = {
++    ".claude", ".git", ".hg", ".svn", ".next", ".nuxt", ".turbo", ".vite",
++    ".venv", "__pycache__", "build", "cache", "coverage", "cuda_outputs",
++    "dist", "downloads", "external-repos", "node_modules", "logs",
++    "live_backups", "memory_backups", "models", "outputs", "pip_cache",
++    "release", "target", "uploads", "venv", "venv_cuda", "MegaGym-Website",
++}
++SKIP_SUFFIXES = (".neurovault.md", ".neurovault.html", ".mammoth.html")
++SKIP_FILENAMES = {
++    ".env", ".env.local", ".env.development.local", ".env.test.local",
++    ".env.production.local", ".git", ".skill-optimizer-ran", ".cache",
++    ".metadata_cache.json", "bun.lockb", "libraries.json",
++    "package-lock.json", "pnpm-lock.yaml", "transcribepro-macos-buildkit.zip",
++    "transcribepro-windows-installer.zip", "yarn.lock", "youtube_cookies.txt",
++    # Config / not project content (the dedicated thesis importer skips these too,
++    # so staleness for the thesis brain doesn't show false positives).
++    ".mcp.json",
++}
++# .bak = local backups, never project content.
++SKIP_EXTS = {".mp4", ".zip", ".bak"}
++
++# Brains that are NOT project clones (skip in staleness / never flag as new).
++NON_PROJECT_BRAINS = {"master", "default"}
++
++# Brains handled by a dedicated importer (no standard import overview).
++SPECIAL_SOURCES = {
++    "thesis": r"C:\Users\steli\Desktop\PwC\uni (thesis)",
++}
++
++# Brains intentionally fed from MORE THAN ONE source folder. The standard import
++# overwrites a brain's single recorded "Source:" line on every run, so a brain
++# that is fed from several folders would otherwise "forget" all but the last one
++# (and the forgotten folders get mis-flagged as never-imported). List every
++# source for such a brain here so staleness + discovery stay correct.
++# When you `update-brain` one of these, run the importer once PER listed source
++# (same --brain-id), e.g.:
++#   import_project_vault.py --source "<A>" --brain-id makeup-game --name "Makeup Game"
++#   import_project_vault.py --source "<B>" --brain-id makeup-game --name "Makeup Game"
++MULTI_SOURCE = {
++    "makeup-game": [
++        r"C:\Users\steli\Documents\Claude_Projects\Makeup Game",
++        r"C:\Users\steli\Documents\Codex_GPT\Makeup Game - Codex",
++    ],
++}
++
++# When scanning a project root for NEVER-imported folders, ignore noise:
++# dotfolders, scratch folders (#...), and the NeuroVault app repo + its
++# legacy/backup/test clones (those are the app, not a project to index).
++def is_noise_folder(name: str) -> bool:
++    low = name.lower()
++    return (
++        name.startswith(".")
++        or name.startswith("#")
++        or low.startswith("neurovault")
++    )
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with p.open("rb") as f:
++        for chunk in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def iter_source_files(root: Path):
++    files = []
++    for d, dirs, names in os.walk(root):
++        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
++        for n in names:
++            if n.startswith("~$") or n.endswith(SKIP_SUFFIXES):
++                continue
++            if n in SKIP_FILENAMES:
++                continue
++            if Path(n).suffix.lower() in SKIP_EXTS:
++                continue
++            files.append(Path(d) / n)
++    return files
++
++
++def needs_copy(src: Path, dst: Path) -> bool:
++    if not dst.exists():
++        return True
++    s, d = src.stat(), dst.stat()
++    if s.st_size == d.st_size and abs(s.st_mtime - d.st_mtime) <= 2:
++        return False
++    return sha256_file(src) != sha256_file(dst)
++
++
++def norm(p: str | Path) -> str:
++    """Normalize a path for comparison: lowercase, no trailing slash."""
++    return os.path.normcase(os.path.normpath(str(p))).rstrip("\\/")
++
++
++def brain_source(nv_home: Path, brain_id: str) -> str | None:
++    """Recorded source folder for a brain, or None if undiscoverable."""
++    if brain_id in SPECIAL_SOURCES:
++        return SPECIAL_SOURCES[brain_id]
++    ov = nv_home / "brains" / brain_id / "vault" / "_neurovault_index" / "00_PROJECT_IMPORT_OVERVIEW.md"
++    if not ov.is_file():
++        return None
++    for line in ov.read_text(encoding="utf-8", errors="replace").splitlines():
++        m = re.match(r"^Source:\s*`?(.+?)`?\s*$", line)
++        if m:
++            return m.group(1)
++    return None
++
++
++def brain_sources(nv_home: Path, brain_id: str) -> list[str]:
++    """Every source folder feeding a brain. Most have exactly one (read from the
++    import overview). Brains in MULTI_SOURCE are fed from several folders, which
++    the overview can't record (last import wins) -- the full list lives there."""
++    if brain_id in MULTI_SOURCE:
++        return list(MULTI_SOURCE[brain_id])
++    src = brain_source(nv_home, brain_id)
++    return [src] if src else []
++
++
++def dest_for(nv_home: Path, brain_id: str, source: str) -> Path:
++    """Where the source is mirrored inside the brain vault."""
++    return nv_home / "brains" / brain_id / "vault" / "_source_files" / Path(source).name
++
++
++def staleness(source: str, dest: Path) -> dict:
++    src_root = Path(source)
++    if not src_root.is_dir():
++        return {"source_missing": True, "new": 0, "changed": 0, "total": 0}
++    new = changed = total = 0
++    for src in iter_source_files(src_root):
++        total += 1
++        dst = dest / src.relative_to(src_root)
++        if not dst.exists():
++            new += 1
++        elif needs_copy(src, dst):
++            changed += 1
++    return {"source_missing": False, "new": new, "changed": changed, "total": total}
++
++
++def load_brains(nv_home: Path) -> list[dict]:
++    reg = nv_home / "brains.json"
++    if not reg.is_file():
++        sys.exit(f"brains.json not found under {nv_home}")
++    data = json.loads(reg.read_text(encoding="utf-8"))
++    return data.get("brains", [])
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description="Discovery + staleness for /update-brain")
++    ap.add_argument("--nv-home", default=NV_HOME_DEFAULT)
++    ap.add_argument("--roots", action="append", default=[],
++                    help="Project-root folder to scan for never-imported projects (repeatable).")
++    ap.add_argument("--source", help="Single project folder: report its brain + staleness only.")
++    args = ap.parse_args()
++
++    nv_home = Path(args.nv_home)
++    brains = load_brains(nv_home)
++
++    # brain_id -> {name, source, dest, sources:[{source,dest}]}
++    mapped: dict[str, dict] = {}
++    source_index: dict[str, str] = {}  # norm(source) -> brain_id
++    for b in brains:
++        bid = b.get("id", "")
++        if bid in NON_PROJECT_BRAINS:
++            continue
++        srcs = brain_sources(nv_home, bid)
++        if not srcs:
++            continue
++        sources = [{"source": s, "dest": str(dest_for(nv_home, bid, s))} for s in srcs]
++        mapped[bid] = {"name": b.get("name", bid),
++                       "source": sources[0]["source"], "dest": sources[0]["dest"],
++                       "sources": sources}
++        for s in srcs:
++            source_index[norm(s)] = bid
++
++    result: dict = {"mode": None, "brains": [], "unimported": [], "single": None}
++
++    # ---- Single-project mode -------------------------------------------------
++    if args.source:
++        result["mode"] = "single"
++        src = args.source
++        bid = source_index.get(norm(src))
++        print(f"# Single project: {src}\n")
++        if bid:
++            dest = dest_for(nv_home, bid, src)
++            st = staleness(src, dest)
++            print(f"Already imported as brain '{bid}' ({mapped[bid]['name']}).")
++            if len(mapped[bid]["sources"]) > 1:
++                print(f"  (note: '{bid}' is fed from {len(mapped[bid]['sources'])} source folders; "
++                      f"this report is for the one queried above)")
++            print(f"  new files:     {st['new']}")
++            print(f"  changed files: {st['changed']}")
++            print(f"  total scanned: {st['total']}")
++            verdict = "UP TO DATE" if st["new"] == 0 and st["changed"] == 0 else "STALE -> refresh recommended"
++            print(f"  verdict: {verdict}")
++            result["single"] = {"brain_id": bid, "name": mapped[bid]["name"],
++                                 "source": src, "dest": str(dest),
++                                 "staleness": st, "imported": True}
++        else:
++            print("NOT imported into any brain yet -> would create a NEW brain.")
++            result["single"] = {"brain_id": None, "source": src, "imported": False}
++        _emit_json(result)
++        return 0
++
++    # ---- Full sweep ----------------------------------------------------------
++    result["mode"] = "full"
++    print("# Brains mapped to a source folder\n")
++    for bid, info in sorted(mapped.items()):
++        per_source = []
++        agg_new = agg_changed = agg_total = 0
++        any_missing = False
++        for sd in info["sources"]:
++            st = staleness(sd["source"], Path(sd["dest"]))
++            per_source.append({**sd, "staleness": st})
++            any_missing = any_missing or st["source_missing"]
++            agg_new += st["new"]
++            agg_changed += st["changed"]
++            agg_total += st["total"]
++        agg = {"source_missing": any_missing, "new": agg_new,
++               "changed": agg_changed, "total": agg_total}
++        flag = ("MISSING SRC" if any_missing and agg_total == 0
++                else "up to date" if agg_new == 0 and agg_changed == 0
++                else f"STALE (+{agg_new} new, ~{agg_changed} changed)")
++        suffix = f"  [{len(info['sources'])} sources]" if len(info["sources"]) > 1 else ""
++        print(f"  {bid:<40} {flag}{suffix}")
++        result["brains"].append({"brain_id": bid, "name": info["name"],
++                                 "source": info["source"], "dest": info["dest"],
++                                 "sources": per_source, "staleness": agg})
++
++    # Never-imported projects under the given roots.
++    if args.roots:
++        print("\n# Never-imported project folders under scanned roots\n")
++        for root in args.roots:
++            rp = Path(root)
++            if not rp.is_dir():
++                print(f"  (root not found: {root})")
++                continue
++            for child in sorted(p for p in rp.iterdir() if p.is_dir()):
++                if norm(child) in source_index:
++                    continue
++                if is_noise_folder(child.name):
++                    continue
++                print(f"  NEW: {child}")
++                result["unimported"].append({"name": child.name, "source": str(child)})
++        if not result["unimported"]:
++            print("  (none -- every project folder already has a brain)")
++
++    _emit_json(result)
++    return 0
++
++
++def _emit_json(result: dict) -> None:
++    print("\n===JSON===")
++    print(json.dumps(result, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/.claude/skills/update-neurovault-app/SKILL.md b/.claude/skills/update-neurovault-app/SKILL.md
+new file mode 100644
+index 0000000..34dda82
+--- /dev/null
++++ b/.claude/skills/update-neurovault-app/SKILL.md
+@@ -0,0 +1,206 @@
++---
++name: update-neurovault-app
++description: >
++  Update the NeuroVault APPLICATION (this code checkout) to a newer upstream
++  release WITHOUT losing the user's local add-ons (SSD eject button, auto-open
++  watcher, loading splash, mmap release fix, graph tweaks, etc.). Uses a rolling
++  one-deep backup: snapshot the current state, rebase the local add-ons onto the
++  new release, then delete the PREVIOUS update's backup. Windows-first. Invoke
++  when the user says "update NeuroVault", "update the app", "there's a new
++  version", "update to vX.Y.Z", or similar. NOTE: updates app code/binary only —
++  refreshing a project's CONTENT into its brain on the SSD is a separate
++  cloning/indexing workflow, not this skill.
++---
++
++# Update the NeuroVault app, keep my tweaks
++
++This repo is a **fork-with-local-tweaks**. `origin` is the upstream NeuroVault repo
++(`github.com/sirdath/NeuroVault`). The user works on a branch named
++`custom/v<NN>-with-local-tweaks` that carries a handful of personal commits on top
++of an upstream release tag, plus some **uncommitted** working-tree tweaks.
++
++The update model the user wants (their words): **"backup → update (passing any
++tweaks I've made) → delete the old backup."** It's a rolling one-deep safety net:
++always keep the snapshot from *this* update, delete the snapshot from the *previous*
++one.
++
++> Do the phases in order. Phases 1–2 are git surgery — show the user what you're
++> about to delete before you delete it. Phase 3 is the build gotcha that bit us
++> last time. Phase 4 proves it actually runs.
++
++---
++
++## Phase 0 — Survey (read-only, no changes)
++
++```bash
++git fetch origin --tags
++node -p "require('./package.json').version"     # CURRENT version, e.g. 0.5.2
++git branch                                       # find custom/v*-with-local-tweaks + any backup
++git tag | sort -V | grep '^v' | tail -5          # newest upstream tags
++git log origin/main..HEAD --oneline              # OUR custom commits (the ones to carry)
++git status --short                               # uncommitted local tweaks to carry too
++```
++
++Establish four facts and state them back to the user before touching anything:
++- **CURRENT_VER** — from `package.json` (e.g. `0.5.2`).
++- **TARGET_TAG** — the release to move to. Use the newest `v*` tag unless the user
++  named one. Confirm it's actually newer than CURRENT_VER.
++- **OUR_COMMITS** — `git log origin/main..HEAD` = the personal commits to replay.
++- **OLD_BACKUP** — any existing `custom/*backup*` / `custom/*working*` branch. This
++  is the one Phase 1 deletes.
++
++If `git status` shows uncommitted tweaks, they're intentional (the user hand-edits
++files like `index.html`, `src-tauri/src/lib.rs`, `src/App.tsx`). They get carried
++via stash in Phase 2 — do **not** discard them.
++
++---
++
++## Phase 1 — Backup, and rotate out the previous backup
++
++```bash
++# Snapshot the CURRENT pre-update state (commits only; uncommitted tweaks are
++# carried separately in Phase 2, but commit-state is what a revert needs).
++TODAY=$(date +%Y%m%d)
++git branch custom/v${CURRENT_VER//./}-backup-$TODAY        # e.g. custom/v052-backup-20260612
++```
++
++Then **delete the previous backup** — but show it first:
++
++```bash
++git branch | grep -iE 'backup|working'      # confirm which is OLD vs the one just made
++git branch -D <OLD_BACKUP>                   # e.g. custom/v041-backup-20260612
++```
++
++Invariant after this phase: exactly **one** backup branch exists — the one made just
++now. If the user has uncommitted tweaks they care about that are NOT yet a commit,
++mention that the backup branch only captures committed state; the working-tree
++copy is still on disk and gets carried in Phase 2.
++
++---
++
++## Phase 2 — Carry the tweaks onto the new release
++
++```bash
++git stash push -u -m "local tweaks before $TARGET_TAG"   # set aside uncommitted tweaks
++git rebase $TARGET_TAG                                     # replay OUR_COMMITS onto the new release
++```
++
++**Rebase conflict policy** — the upstream delta is large (last time: 126 files).
++When a conflict hits one of our commits, **keep our addition and re-apply upstream's
++surrounding changes around it**. Our changes are additive (a new button, a new Rust
++command, a new pragma) — they should slot in next to upstream's, not replace them.
++After resolving: `git add <files>` then `git rebase --continue`.
++
++Then restore the uncommitted tweaks:
++
++```bash
++git stash pop          # may conflict — resolve per the rules below
++```
++
++`stash pop` conflict rules (these are the exact cases we hit):
++- **Content conflict in a file we both changed** (e.g. `src/App.tsx`): keep BOTH —
++  our additions (Eject button) *and* upstream's new markup (window-mode menu). Take
++  the stashed side for our hunk, keep upstream's for theirs.
++- **modify/delete where upstream DELETED the file** (e.g.
++  `src-tauri/gen/schemas/capabilities.json` — an auto-generated artifact): accept the
++  deletion → `git rm <file>`. Don't resurrect generated files.
++- After resolving everything: `git add -A`, then `git stash drop`.
++
++Finally, rename the working branch to the new version:
++
++```bash
++git branch -m custom/v${CURRENT_VER//./}-with-local-tweaks custom/v${TARGET_TAG_DIGITS}-with-local-tweaks
++```
++
++Sanity check: `git log --oneline -6` — OUR_COMMITS should sit directly on top of the
++TARGET_TAG release commit.
++
++---
++
++## Phase 3 — Stage the sidecar (REQUIRED since v0.5.x, or the build won't even check)
++
++v0.5.x bundles `neurovault-server` as a Tauri **sidecar** (`externalBin`). The crate's
++`build.rs` validates that binary exists on **every** compile — including `cargo check`
++and `tauri dev` — so a fresh checkout fails with:
++
++```
++resource path `binaries\neurovault-server-<triple>.exe` doesn't exist
++```
++
++Stage it once (the helper does the `TAURI_CONFIG` escape-hatch build + copy):
++
++```powershell
++pwsh -File .claude/skills/update-neurovault/stage-sidecar-dev.ps1
++```
++
++Then verify the Rust side compiles:
++
++```bash
++cd src-tauri && cargo check        # expect: Finished, no errors
++```
++
++`src-tauri/binaries/` is gitignored — the staged binary is a build artifact, never
++committed.
++
++---
++
++## Phase 4 — Launch and verify it actually runs
++
++**Kill any stale `neurovault.exe` first** — a leftover process locks
++`target\debug\neurovault.exe` and the rebuild dies with `Access is denied (os error 5)`:
++
++```powershell
++Get-Process neurovault -ErrorAction SilentlyContinue | Stop-Process -Force
++```
++
++**Launch.** If the SSD brain is plugged in, prefer the real launcher
++`Start-NeuroVault-SSD.cmd` (it sets `NEUROVAULT_HOME` with the *quoted* `set "VAR=val"`
++form — important, see gotcha below). Launch with **separate** redirect files via
++`Start-Process` — do NOT use `cmd /c "script.cmd > log"`, the in-cmd redirect gets
++mangled and no log appears:
++
++```powershell
++$out="$env:LOCALAPPDATA\NeuroVault\devrun.log"; $err="$env:LOCALAPPDATA\NeuroVault\devrun.err.log"
++$env:NEUROVAULT_HOME="D:\NEURO-VAULT-STORAGE\.neurovault"   # only if launching npx directly
++Start-Process npx.cmd -ArgumentList "tauri","dev" `
++  -WorkingDirectory "<repo>" -RedirectStandardOutput $out -RedirectStandardError $err `
++  -WindowStyle Hidden -PassThru
++```
++
++**Verify** (all three should pass):
++- `Get-Process neurovault | Select MainWindowHandle` → non-zero (window is up).
++- `Invoke-WebRequest http://127.0.0.1:8765/api/status` → HTTP 200 (backend alive;
++  note `/status`, `/brains` etc. are 404 — `/api/status` is the real route).
++- stderr log contains `vault watcher started for brain <id>` — and `<id>` matches the
++  active brain in the SSD's `brains.json` (proves it read the SSD, not the C: fallback).
++
++---
++
++## Phase 5 — Report
++
++Tell the user:
++- New working branch: `custom/v<NEW>-with-local-tweaks` (= release + their commits).
++- Backup kept: `custom/v<CURRENT>-backup-<date>` (one revert away:
++  `git checkout custom/v<CURRENT>-backup-<date>`).
++- Old backup deleted: `<OLD_BACKUP>`.
++- Which add-ons survived (eject button/command, watcher, splash, mmap fix, graph tweaks).
++- Anything new the release adds that they'll notice.
++
++If anything failed verification, say so plainly and offer the one-line revert above —
++do **not** claim success on a build you didn't see run.
++
++---
++
++## Gotchas log (things that bit us on the v0.4.1 → v0.5.2 update)
++
++- **Trailing-space env var.** `cmd /c "... && set NEUROVAULT_HOME=D:\..\.neurovault && .."`
++  (unquoted) captures the space before `&&` *into the value* → path `…\.neurovault `
++  → "system cannot find the path" panic at `vault_dir()`. Fixed in source with
++  `.trim()` on the env var, and the launcher `.cmd` uses the quoted `set "VAR=val"`
++  form. If you ever set it inline, use the quoted form.
++- **Sidecar not staged** → build.rs check fails before any compile (Phase 3).
++- **Stale neurovault.exe** → `Access is denied` removing the exe on rebuild (Phase 4).
++- **In-cmd redirect** (`cmd /c "x > log"`) → no log file created; use `Start-Process`
++  `-RedirectStandardOutput/-Error` instead.
++- **Auto-generated files in conflicts** (`gen/schemas/capabilities.json`): accept
++  upstream's deletion, don't resurrect.
+diff --git a/.claude/skills/update-neurovault-app/stage-sidecar-dev.ps1 b/.claude/skills/update-neurovault-app/stage-sidecar-dev.ps1
+new file mode 100644
+index 0000000..1607928
+--- /dev/null
++++ b/.claude/skills/update-neurovault-app/stage-sidecar-dev.ps1
+@@ -0,0 +1,66 @@
++<#
++  stage-sidecar-dev.ps1
++  ---------------------
++  Stage the `neurovault-server` MCP sidecar binary for a DEV build.
++
++  Why this is needed: since v0.5.x the app crate's build.rs (tauri_build)
++  validates that the externalBin `binaries/neurovault-server-<triple>[.exe]`
++  exists on EVERY compile of the crate -- including `cargo check` and
++  `tauri dev`. A fresh checkout has no such binary, so the build fails with:
++      resource path `binaries\neurovault-server-<triple>.exe` doesn't exist
++
++  The escape hatch (same trick as scripts/stage-sidecar.mjs, but debug):
++  build `neurovault-server` with TAURI_CONFIG overriding externalBin to []
++  so its own build.rs check is disabled, then copy the produced binary into
++  src-tauri/binaries/ where the app build expects it.
++
++  This is a build artifact -- src-tauri/binaries/ is gitignored. Re-run it
++  after a clean, after an upstream bump, or whenever cargo complains the
++  resource path doesn't exist.
++
++  Usage:  pwsh -File .claude/skills/update-neurovault/stage-sidecar-dev.ps1
++          (optional)  -Release   # stage from a release build instead of debug
++#>
++param([switch]$Release)
++
++$ErrorActionPreference = 'Stop'
++
++# Repo root = two levels up from this script (.claude/skills/update-neurovault/).
++$repo    = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
++$srcTauri = Join-Path $repo 'src-tauri'
++
++# Host target triple, e.g. x86_64-pc-windows-msvc.
++$hostLine = (& rustc -vV) | Where-Object { $_ -like 'host:*' }
++if (-not $hostLine) { throw 'could not determine host triple from `rustc -vV`' }
++$triple = $hostLine.Substring('host:'.Length).Trim()
++$exe = if ($triple -like '*windows*') { '.exe' } else { '' }
++$profile = if ($Release) { 'release' } else { 'debug' }
++
++Write-Host "[stage-sidecar-dev] building neurovault-server ($profile) for $triple (externalBin check disabled)"
++
++# Build the sidecar with externalBin removed from the effective config so its
++# build.rs does not require the very binary we are producing.
++$prevTauriConfig = $env:TAURI_CONFIG
++$env:TAURI_CONFIG = '{"bundle":{"externalBin":[]}}'
++try {
++    Push-Location $srcTauri
++    $cargoArgs = @('build', '--bin', 'neurovault-server')
++    if ($Release) { $cargoArgs += '--release' }
++    & cargo @cargoArgs
++    if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
++} finally {
++    Pop-Location
++    $env:TAURI_CONFIG = $prevTauriConfig
++}
++
++$built = Join-Path $srcTauri "target\$profile\neurovault-server$exe"
++if (-not (Test-Path $built)) { throw "built sidecar not found at $built" }
++
++$outDir = Join-Path $srcTauri 'binaries'
++New-Item -ItemType Directory -Force -Path $outDir | Out-Null
++$dest = Join-Path $outDir "neurovault-server-$triple$exe"
++Copy-Item $built $dest -Force
++
++$mb = '{0:N1}' -f ((Get-Item $dest).Length / 1MB)
++Write-Host "[stage-sidecar-dev] staged -> $dest ($mb MB)"
++Write-Host "[stage-sidecar-dev] done. You can now run: cd src-tauri; cargo check"
+diff --git a/Eject-NeuroVaultSSD.ps1 b/Eject-NeuroVaultSSD.ps1
+new file mode 100644
+index 0000000..3e8e481
+--- /dev/null
++++ b/Eject-NeuroVaultSSD.ps1
+@@ -0,0 +1,89 @@
++<#
++  Eject-NeuroVaultSSD.ps1  -DriveLetter D:
++  ----------------------------------------
++  Safely removes the external SSD that hosts the NeuroVault brain, the same
++  way the Windows tray "Safely Remove Hardware" does, via
++  CM_Request_Device_Eject. Unlike "mountvol /P", this PRESERVES the drive
++  letter, so on replug the volume comes back as D: and auto-open works.
++
++  Run on demand by the "NeuroVault-Eject" scheduled task (triggered by the
++  app's Eject SSD Brain button). Sequence:
++    1. Wait for the NeuroVault app to exit (release its mmap/handles).
++    2. Stop the auto-open watcher (so its polling does not hold the volume).
++    3. CM_Request_Device_Eject, walking up the device tree to the USB node.
++    4. Re-arm the watcher for the next replug.
++    5. If it could not eject (a handle is still open, e.g. an Explorer
++       window), leave the drive mounted (data already flushed) and notify.
++
++  IMPORTANT: keep this file ASCII-only. Smart quotes / em-dashes corrupt
++  under Windows PowerShell 5.1 and cause a parse error.
++
++  Log: %LOCALAPPDATA%\NeuroVault\eject.log
++#>
++param([string]$DriveLetter = 'D:')
++
++$ErrorActionPreference = 'SilentlyContinue'
++$Task   = 'NeuroVault Auto-Open on SSD'
++$dl     = $DriveLetter.TrimEnd('\').TrimEnd(':')          # 'D'
++$marker = "${dl}:\NEURO-VAULT-STORAGE\.neurovault\brains.json"
++$log      = Join-Path $env:LOCALAPPDATA 'NeuroVault\eject.log'
++$suppress = Join-Path $env:LOCALAPPDATA 'NeuroVault\suppress-autoopen.flag'
++New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
++function L($m){ "$([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))  $m" | Out-File $log -Append -Encoding utf8 }
++
++L "eject requested for ${dl}:"
++
++# 1. Wait for the app to fully exit (releases brain.db + its 256MB mmap).
++for ($i = 0; $i -lt 40; $i++) { if (-not (Get-Process neurovault -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Milliseconds 500 }
++Start-Sleep -Milliseconds 800
++L "app exited; stopping watcher"
++
++# 2. Stop the auto-open watcher so its 4s D: poll cannot veto the eject.
++Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
++Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
++  Where-Object { $_.CommandLine -like '*Watch-NeuroVault-SSD*' } |
++  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
++Start-Sleep -Milliseconds 600
++
++# 3. Device-level safe removal.
++Add-Type -TypeDefinition @'
++using System; using System.Text; using System.Runtime.InteropServices;
++public static class NvPnp {
++  [DllImport("CfgMgr32.dll", CharSet=CharSet.Unicode)] public static extern int CM_Locate_DevNode(out uint d, string id, int f);
++  [DllImport("CfgMgr32.dll")] public static extern int CM_Get_Parent(out uint p, uint d, int f);
++  [DllImport("CfgMgr32.dll", CharSet=CharSet.Unicode)] public static extern int CM_Request_Device_Eject(uint d, out int v, StringBuilder n, int len, int f);
++}
++'@ -ErrorAction SilentlyContinue
++
++$ejected = $false
++$disk = Get-Partition -DriveLetter $dl -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue
++if ($disk) {
++  $pnp = (Get-CimInstance Win32_DiskDrive | Where-Object { $_.Index -eq $disk.Number }).PNPDeviceID
++  $node = 0
++  [NvPnp]::CM_Locate_DevNode([ref]$node, $pnp, 0) | Out-Null
++  for ($lvl = 0; $lvl -lt 4; $lvl++) {
++    $veto = 0; $vn = New-Object System.Text.StringBuilder 512
++    $r = [NvPnp]::CM_Request_Device_Eject($node, [ref]$veto, $vn, 512, 0)
++    L "level $lvl eject=$r veto=$veto"
++    Start-Sleep -Milliseconds 1500
++    if (-not (Test-Path $marker)) { $ejected = $true; L "EJECTED at level $lvl"; break }
++    $p = 0; if ([NvPnp]::CM_Get_Parent([ref]$p, $node, 0) -ne 0) { break }; $node = $p
++  }
++} else { L "no disk found for ${dl}:" }
++
++# 4 + 5. Re-arm the watcher and report. On a FAILED eject the drive is
++# still present, so drop a sentinel FIRST: it tells the re-armed watcher
++# to treat the current presence as baseline instead of relaunching the
++# app (the app reopening is what re-locks the drive and defeats a retry).
++# A genuine unplug + replug still auto-opens.
++if ($ejected) {
++  Start-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
++  L "done: safely removed ${dl}:"
++} else {
++  New-Item -ItemType File -Path $suppress -Force | Out-Null
++  Start-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
++  L "could NOT eject ${dl}: (a handle is still open) - drive left mounted, data already flushed; relaunch suppressed"
++  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
++  $msg = "NeuroVault flushed and saved everything, but could not auto-eject ${dl}: because another program still has it open - most often the File Explorer window that opens automatically when you plug the drive in." + [Environment]::NewLine + [Environment]::NewLine + "Close that File Explorer window, then use Windows 'Safely Remove Hardware', or just close it and unplug. Your data is safe."
++  [System.Windows.Forms.MessageBox]::Show($msg, "NeuroVault: SSD still in use", 'OK', 'Warning') | Out-Null
++}
+diff --git a/Register-NeuroVault-AutoOpen.ps1 b/Register-NeuroVault-AutoOpen.ps1
+new file mode 100644
+index 0000000..dfc995e
+--- /dev/null
++++ b/Register-NeuroVault-AutoOpen.ps1
+@@ -0,0 +1,47 @@
++<#
++  Register-NeuroVault-AutoOpen.ps1
++  --------------------------------
++  Registers (or removes) a hidden Scheduled Task that runs
++  Watch-NeuroVault-SSD.ps1 at logon, so NeuroVault auto-opens whenever
++  the NeuroVault SSD is connected.
++
++  Usage:
++    powershell -ExecutionPolicy Bypass -File Register-NeuroVault-AutoOpen.ps1
++    powershell -ExecutionPolicy Bypass -File Register-NeuroVault-AutoOpen.ps1 -Remove
++
++  No admin rights needed — it registers a per-user task.
++#>
++param([switch]$Remove)
++
++$ErrorActionPreference = 'Stop'
++$TaskName = 'NeuroVault Auto-Open on SSD'
++$Watcher  = Join-Path $PSScriptRoot 'Watch-NeuroVault-SSD.ps1'
++
++if ($Remove) {
++    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
++    "Removed scheduled task '$TaskName'."
++    return
++}
++
++if (-not (Test-Path -LiteralPath $Watcher)) {
++    throw "Watcher script not found next to this file: $Watcher"
++}
++
++$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
++    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Watcher`""
++
++$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
++
++$settings = New-ScheduledTaskSettingsSet `
++    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
++    -StartWhenAvailable -MultipleInstances IgnoreNew `
++    -ExecutionTimeLimit ([TimeSpan]::Zero) `
++    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
++
++$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
++    -LogonType Interactive -RunLevel Limited
++
++Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
++    -Settings $settings -Principal $principal -Force | Out-Null
++
++"Registered scheduled task '$TaskName' (runs hidden at logon)."
+diff --git a/Register-NeuroVault-Eject.ps1 b/Register-NeuroVault-Eject.ps1
+new file mode 100644
+index 0000000..89b02f3
+--- /dev/null
++++ b/Register-NeuroVault-Eject.ps1
+@@ -0,0 +1,48 @@
++<#
++  Register-NeuroVault-Eject.ps1
++  -----------------------------
++  Registers (or removes) the on-demand "NeuroVault-Eject" scheduled task.
++  The Eject SSD Brain button triggers this task (schtasks /Run). Running the
++  eject as a task — rather than a child process the app spawns — means it:
++    * survives the app closing (a task is independent of the app's process
++      tree, so it isn't killed when NeuroVault exits), and
++    * runs elevated (RunLevel Highest), so the device-eject of the
++      Fixed-type USB SSD is never blocked by insufficient rights.
++
++  The task runs Eject-NeuroVaultSSD.ps1, which waits for the app to exit,
++  then safely removes the drive (CM_Request_Device_Eject, preserving the
++  drive letter) and re-arms the auto-open watcher.
++
++  Usage:
++    powershell -ExecutionPolicy Bypass -File Register-NeuroVault-Eject.ps1
++    powershell -ExecutionPolicy Bypass -File Register-NeuroVault-Eject.ps1 -Remove
++#>
++param([switch]$Remove)
++
++$ErrorActionPreference = 'Stop'
++$TaskName = 'NeuroVault-Eject'
++$Script   = Join-Path $PSScriptRoot 'Eject-NeuroVaultSSD.ps1'
++
++if ($Remove) {
++    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
++    "Removed scheduled task '$TaskName'."
++    return
++}
++
++if (-not (Test-Path -LiteralPath $Script)) { throw "Eject script not found: $Script" }
++
++$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
++    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Script`" -DriveLetter D:"
++
++$settings = New-ScheduledTaskSettingsSet `
++    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
++    -MultipleInstances IgnoreNew `
++    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
++
++$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
++    -LogonType Interactive -RunLevel Highest
++
++# No trigger — this task is launched on demand by the app (schtasks /Run).
++Register-ScheduledTask -TaskName $TaskName -Action $action -Settings $settings -Principal $principal -Force | Out-Null
++
++"Registered on-demand task '$TaskName' (runs Eject-NeuroVaultSSD.ps1, elevated)."
+diff --git a/Show-NeuroVault-Splash.ps1 b/Show-NeuroVault-Splash.ps1
+new file mode 100644
+index 0000000..87c3476
+--- /dev/null
++++ b/Show-NeuroVault-Splash.ps1
+@@ -0,0 +1,230 @@
++<#
++  Show-NeuroVault-Splash.ps1
++  --------------------------
++  Slick, minimal loading indicator shown the instant the NeuroVault SSD
++  is detected, so you get feedback while `tauri dev` boots + compiles.
++
++  Look: a fully transparent, borderless window floating over the desktop
++  with the NeuroVault mark in the center and an animated ring around it.
++
++  It is intentionally independent of the Tauri app: it appears BEFORE
++  the app window exists (during the Vite + cargo build), then closes
++  itself the moment the real NeuroVault window comes up.
++
++  -Style:
++    spin  - a short bright arc rotates endlessly around the ring (default).
++    fill  - the ring fills clockwise like a progress circle, then gently
++            pulses if the app still isn't up.
++    both  - fills once, then switches to the rotating arc so it never
++            looks stuck.
++
++  Self-closing logic:
++    - polls for a `neurovault` process whose main window is visible,
++    - or gives up after a safety timeout (so it never hangs forever).
++
++  Launched (hidden) by Watch-NeuroVault-SSD.ps1 on the SSD-connect
++  transition.
++
++  Preview:
++    powershell -ExecutionPolicy Bypass -File Show-NeuroVault-Splash.ps1 -Preview -Style fill
++    (runs for ~8s even if NeuroVault is already open, shows a caption,
++     so you can compare styles)
++#>
++param(
++    [switch]$Preview,
++    [ValidateSet('spin','fill','both')]
++    [string]$Style = 'fill',
++    [int]$PreviewOffsetX = 0
++)
++
++$ErrorActionPreference = 'SilentlyContinue'
++
++# ---- Config ---------------------------------------------------------------
++$TimeoutSeconds = 120   # hard cap: never keep the splash up longer than this
++$PollMs         = 750   # how often to check whether the app window is up
++$LogoRelative   = 'assets\brand\neurovault-mark-1024.png'
++$FillSeconds    = if ($Preview) { 4 } else { 25 }   # est. fill duration
++# ---------------------------------------------------------------------------
++
++Add-Type -AssemblyName PresentationFramework
++Add-Type -AssemblyName PresentationCore
++Add-Type -AssemblyName WindowsBase
++
++function NeuroVault-WindowUp {
++    $p = Get-Process -Name 'neurovault' -ErrorAction SilentlyContinue |
++         Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
++    return [bool]$p
++}
++
++# If the app is already up, there's nothing to wait for (unless previewing).
++if (-not $Preview -and (NeuroVault-WindowUp)) { return }
++
++# ---- Build the window from XAML ------------------------------------------
++[xml]$xaml = @"
++<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
++        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
++        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
++        Topmost="True" ShowInTaskbar="False" WindowStartupLocation="CenterScreen"
++        Width="184" Height="208">
++  <Grid>
++    <!-- faint full ring (the track) -->
++    <Ellipse Width="150" Height="150" Margin="0,0,0,24"
++             HorizontalAlignment="Center" VerticalAlignment="Center"
++             Stroke="#2F7BFF" StrokeThickness="6" Opacity="0.16"/>
++
++    <!-- spinning arc (~95 degrees) -->
++    <Path x:Name="spinArc" Stroke="#2F7BFF" StrokeThickness="6"
++          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
++          HorizontalAlignment="Center" VerticalAlignment="Center"
++          Margin="0,0,0,24" Visibility="Collapsed"
++          Data="M 75,0 A 75,75 0 0 1 150,75"
++          RenderTransformOrigin="0.5,0.5">
++      <Path.RenderTransform>
++        <RotateTransform x:Name="spin" Angle="0"/>
++      </Path.RenderTransform>
++    </Path>
++
++    <!-- filling ring (progress style) -->
++    <Ellipse x:Name="fillRing" Width="150" Height="150" Margin="0,0,0,24"
++             HorizontalAlignment="Center" VerticalAlignment="Center"
++             Stroke="#2F7BFF" StrokeThickness="6" StrokeDashCap="Round"
++             Visibility="Collapsed" RenderTransformOrigin="0.5,0.5">
++      <Ellipse.RenderTransform>
++        <RotateTransform Angle="-90"/>
++      </Ellipse.RenderTransform>
++    </Ellipse>
++
++    <!-- NeuroVault mark in the center -->
++    <Image x:Name="logo" Width="78" Height="78" Margin="0,0,0,24"
++           HorizontalAlignment="Center" VerticalAlignment="Center"/>
++
++    <!-- preview-only caption -->
++    <TextBlock x:Name="caption" Text="" Foreground="#8C96AF"
++               FontFamily="Segoe UI" FontSize="12"
++               HorizontalAlignment="Center" VerticalAlignment="Bottom"
++               Margin="0,0,0,6"/>
++  </Grid>
++</Window>
++"@
++
++$reader        = New-Object System.Xml.XmlNodeReader $xaml
++$script:window = [Windows.Markup.XamlReader]::Load($reader)
++
++$spinArc  = $script:window.FindName('spinArc')
++$spin     = $script:window.FindName('spin')
++$fillRing = $script:window.FindName('fillRing')
++
++# logo source
++$logoPath = Join-Path $PSScriptRoot $LogoRelative
++if (Test-Path -LiteralPath $logoPath) {
++    $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
++    $bmp.BeginInit()
++    $bmp.CacheOption = 'OnLoad'
++    $bmp.UriSource   = New-Object System.Uri($logoPath)
++    $bmp.EndInit()
++    ($script:window.FindName('logo')).Source = $bmp
++}
++
++if ($Preview) {
++    ($script:window.FindName('caption')).Text = $Style
++    if ($PreviewOffsetX -ne 0) {
++        $sw = [System.Windows.SystemParameters]::PrimaryScreenWidth
++        $sh = [System.Windows.SystemParameters]::PrimaryScreenHeight
++        $script:window.WindowStartupLocation = 'Manual'
++        $script:window.Left = ($sw / 2) - ($script:window.Width / 2) + $PreviewOffsetX
++        $script:window.Top  = ($sh / 2) - ($script:window.Height / 2)
++    }
++}
++
++# ---- Animations -----------------------------------------------------------
++function Start-Spin {
++    $spinArc.Visibility = 'Visible'
++    $a = New-Object System.Windows.Media.Animation.DoubleAnimation
++    $a.From = 0; $a.To = 360
++    $a.Duration       = New-Object System.Windows.Duration ([TimeSpan]::FromSeconds(1.15))
++    $a.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
++    $spin.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $a)
++}
++
++function Start-Pulse {
++    $p = New-Object System.Windows.Media.Animation.DoubleAnimation
++    $p.From = 1.0; $p.To = 0.4
++    $p.Duration       = New-Object System.Windows.Duration ([TimeSpan]::FromSeconds(0.9))
++    $p.AutoReverse    = $true
++    $p.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
++    $fillRing.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $p)
++}
++
++function Start-Fill([bool]$loop, [scriptblock]$onDone) {
++    $L = [Math]::PI * 150.0 / 6.0    # circumference in stroke-thickness units
++    $fillRing.StrokeDashArray  = New-Object System.Windows.Media.DoubleCollection (,[double[]]@($L, $L))
++    $fillRing.StrokeDashOffset = $L
++    $fillRing.Visibility       = 'Visible'
++    $a = New-Object System.Windows.Media.Animation.DoubleAnimation
++    $a.From = $L; $a.To = 0
++    $a.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromSeconds($FillSeconds))
++    if ($loop) {
++        $a.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
++    } elseif ($onDone) {
++        $a.Add_Completed($onDone)
++    }
++    $fillRing.BeginAnimation([System.Windows.Shapes.Shape]::StrokeDashOffsetProperty, $a)
++}
++
++# ---- Fill state -----------------------------------------------------------
++# The fill is ASYMPTOTIC: it eases toward full but is capped below 100% and
++# only COMPLETES when the app window actually appears. So a full ring always
++# means "NeuroVault is up" - it never fills and then sits there waiting.
++$script:L     = [Math]::PI * 150.0 / 6.0   # ring circumference in dash units
++$script:p     = 0.0                         # current fill fraction 0..1
++$script:appUp = $false
++$fillTau      = 15.0   # creep time-constant in seconds (smaller = faster early)
++$fillCap      = 0.95   # never pass this until the app is genuinely up
++$previewUpAt  = 6.0    # in preview, pretend the app appears at 6s
++
++switch ($Style) {
++    'spin' { Start-Spin }
++    'both' { Start-Fill $false { $fillRing.Visibility = 'Collapsed'; Start-Spin } }
++    'fill' {
++        $fillRing.StrokeDashArray  = New-Object System.Windows.Media.DoubleCollection (,[double[]]@($script:L, $script:L))
++        $fillRing.StrokeDashOffset = $script:L   # start empty
++        $fillRing.Visibility       = 'Visible'
++    }
++}
++
++# ---- Drive the fill + self-close ------------------------------------------
++$script:start    = Get-Date
++$script:tick     = 0
++$script:deadline = if ($Preview) { (Get-Date).AddSeconds(12) } else { (Get-Date).AddSeconds($TimeoutSeconds) }
++$script:timer = New-Object System.Windows.Threading.DispatcherTimer
++$script:timer.Interval = [TimeSpan]::FromMilliseconds(120)
++$script:timer.Add_Tick({
++    $script:tick++
++    $elapsed = ((Get-Date) - $script:start).TotalSeconds
++
++    # Detect the real app window (throttled to ~once a second).
++    if (-not $script:appUp) {
++        if ($Preview) { if ($elapsed -ge $previewUpAt) { $script:appUp = $true } }
++        elseif ($script:tick % 8 -eq 0) { if (NeuroVault-WindowUp) { $script:appUp = $true } }
++    }
++
++    if ($Style -eq 'fill') {
++        if ($script:appUp) {
++            # App is up: drive the ring the rest of the way, then close.
++            $script:p = [Math]::Min(1.0, $script:p + 0.06)
++            $fillRing.StrokeDashOffset = $script:L * (1.0 - $script:p)
++            if ($script:p -ge 1.0) { $script:timer.Stop(); $script:window.Close() }
++        } else {
++            # Still starting: ease toward the cap, never reaching full.
++            $target = $fillCap * (1.0 - [Math]::Exp(-$elapsed / $fillTau))
++            if ($target -gt $script:p) { $script:p = $target }
++            $fillRing.StrokeDashOffset = $script:L * (1.0 - $script:p)
++            if ((Get-Date) -gt $script:deadline) { $script:timer.Stop(); $script:window.Close() }
++        }
++    } else {
++        if ($script:appUp -or ((Get-Date) -gt $script:deadline)) { $script:timer.Stop(); $script:window.Close() }
++    }
++})
++$script:timer.Start()
++
++$script:window.ShowDialog() | Out-Null
+diff --git a/Start-NeuroVault-SSD.cmd b/Start-NeuroVault-SSD.cmd
+new file mode 100644
+index 0000000..b519485
+--- /dev/null
++++ b/Start-NeuroVault-SSD.cmd
+@@ -0,0 +1,44 @@
++@echo off
++setlocal enabledelayedexpansion
++
++REM ---------------------------------------------------------------------------
++REM  Start-NeuroVault-SSD.cmd
++REM  Launches the STANDALONE NeuroVault app (installed at %LOCALAPPDATA%\NeuroVault).
++REM
++REM  This used to run `npx tauri dev` -- a DEVELOPER server that needs Vite on
++REM  localhost:1420 staying alive. That's why the window would randomly show
++REM  "localhost refused to connect" whenever Vite died. The installed release
++REM  build bundles the UI inside the exe, so it needs no Vite and no Node --
++REM  just double-click. To ship a newer standalone: `npm run tauri build`, then
++REM  re-run the NSIS installer from src-tauri\target\release\bundle\nsis.
++REM ---------------------------------------------------------------------------
++
++set "APP=%LOCALAPPDATA%\NeuroVault\neurovault.exe"
++set "MARKER=NEURO-VAULT-STORAGE\.neurovault\brains.json"
++
++REM Find the NeuroVault SSD by its marker file on ANY drive letter (the app
++REM itself auto-detects the same way, so we don't hardcode a drive letter --
++REM whatever letter the SSD mounts as, this finds it). D: is checked first.
++set "SSD="
++for %%D in (D E F G H I J K L M N O P Q R S T U V W X Y Z A B C) do (
++  if not defined SSD if exist "%%D:\%MARKER%" set "SSD=%%D:"
++)
++
++if not defined SSD (
++  echo NeuroVault SSD was not found ^(no drive contains %MARKER%^).
++  echo Plug in the external SSD first, then run this launcher again.
++  pause
++  exit /b 1
++)
++
++if not exist "%APP%" (
++  echo NeuroVault is not installed at:
++  echo   %APP%
++  echo Run the installer from src-tauri\target\release\bundle\nsis first.
++  pause
++  exit /b 1
++)
++
++echo Starting NeuroVault ^(standalone^) with SSD brain storage at %SSD%\NEURO-VAULT-STORAGE
++start "" "%APP%"
++endlocal
+diff --git a/Watch-NeuroVault-SSD.ps1 b/Watch-NeuroVault-SSD.ps1
+new file mode 100644
+index 0000000..fbe6b8b
+--- /dev/null
++++ b/Watch-NeuroVault-SSD.ps1
+@@ -0,0 +1,90 @@
++<#
++  Watch-NeuroVault-SSD.ps1
++  -------------------------
++  Auto-launches NeuroVault when the NeuroVault SSD is connected.
++
++  How it identifies "the" SSD: not by drive letter (which can change),
++  but by the presence of the marker file
++      <drive>:\NEURO-VAULT-STORAGE\.neurovault\brains.json
++  So whatever letter the drive mounts as, this finds it.
++
++  Behaviour:
++    - Launches on the CONNECT transition (absent -> present), so closing
++      NeuroVault while the SSD stays plugged in does NOT reopen it.
++    - Skips launching if NeuroVault is already running.
++    - If the SSD is already plugged in when this watcher starts (e.g. at
++      logon), that counts as a connect and it launches once.
++
++  Runs continuously in the background. Registered to start at logon by
++  Register-NeuroVault-AutoOpen.ps1 (a hidden Scheduled Task).
++#>
++
++$ErrorActionPreference = 'SilentlyContinue'
++
++# ---- Config ---------------------------------------------------------------
++$MarkerRelative = 'NEURO-VAULT-STORAGE\.neurovault\brains.json'
++$Launcher       = 'C:\Users\steli\Documents\Claude_Projects\NeuroVault_byDath\Start-NeuroVault-SSD.cmd'
++$PollSeconds    = 4
++$LogFile        = Join-Path $env:LOCALAPPDATA 'NeuroVault\auto-open.log'
++$SuppressFlag   = Join-Path $env:LOCALAPPDATA 'NeuroVault\suppress-autoopen.flag'
++# ---------------------------------------------------------------------------
++
++New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null
++
++function Write-Log([string]$msg) {
++    "$([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))  $msg" | Out-File -FilePath $LogFile -Append -Encoding utf8
++}
++
++function Find-SsdDrive {
++    foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
++        $candidate = Join-Path ($d.Root) $MarkerRelative
++        if (Test-Path -LiteralPath $candidate) { return $d.Root.TrimEnd('\') }
++    }
++    return $null
++}
++
++function NeuroVault-Running {
++    [bool](Get-Process -Name 'neurovault' -ErrorAction SilentlyContinue)
++}
++
++function Show-Splash {
++    $splash = Join-Path $PSScriptRoot 'Show-NeuroVault-Splash.ps1'
++    if (-not (Test-Path -LiteralPath $splash)) { return }
++    Start-Process -FilePath 'powershell.exe' `
++        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$splash`"" `
++        -WindowStyle Hidden
++}
++
++function Launch-NeuroVault([string]$drive) {
++    if (NeuroVault-Running) { Write-Log "SSD at $drive but NeuroVault already running - skip"; return }
++    if (-not (Test-Path -LiteralPath $Launcher)) { Write-Log "Launcher not found: $Launcher"; return }
++    Write-Log "SSD detected at $drive - showing splash + launching NeuroVault"
++    Show-Splash   # instant feedback while tauri dev boots/compiles; self-closes when the app window is up
++    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', "`"$Launcher`"" -WindowStyle Hidden
++}
++
++Write-Log "watcher started (poll ${PollSeconds}s, marker '$MarkerRelative')"
++
++# Baseline. Normally a watcher that starts with the SSD already present
++# treats that as a connect and launches once (e.g. at logon). But if an
++# eject just re-armed us, a sentinel file tells us to treat the current
++# presence as the baseline instead - otherwise a failed eject would
++# immediately reopen the app and re-lock the drive. A genuine unplug +
++# replug (a real absent -> present transition) still launches.
++$prevPresent = $false
++if (Test-Path -LiteralPath $SuppressFlag) {
++    Remove-Item -LiteralPath $SuppressFlag -Force -ErrorAction SilentlyContinue
++    $prevPresent = [bool](Find-SsdDrive)
++    Write-Log "suppress flag honored - baseline set, not auto-launching the already-present SSD"
++}
++while ($true) {
++    $drive   = Find-SsdDrive
++    $present = [bool]$drive
++    if ($present -and -not $prevPresent) {
++        # Fresh connect (or SSD already present at watcher start).
++        Start-Sleep -Seconds 2   # let the volume + drive letter settle
++        if (Find-SsdDrive) { Launch-NeuroVault $drive }
++    }
++    $prevPresent = $present
++    Start-Sleep -Seconds $PollSeconds
++}
+diff --git a/scripts/_nv_staleness_check.py b/scripts/_nv_staleness_check.py
+new file mode 100644
+index 0000000..90ecf6e
+--- /dev/null
++++ b/scripts/_nv_staleness_check.py
+@@ -0,0 +1,61 @@
++"""Read-only staleness check: how far behind is a brain's clone vs the working folder?
++Reuses the same skip rules + needs_copy logic as thesis_incremental_refresh.py.
++Usage: python _nv_staleness_check.py "<SOURCE_ROOT>" "<DEST_ROOT>"
++"""
++from __future__ import annotations
++import hashlib, os, sys
++from pathlib import Path
++
++SKIP_DIRS = {".git", ".claude", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", "target"}
++SKIP_SUFFIXES = (".neurovault.md", ".neurovault.html", ".mammoth.html")
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with p.open("rb") as f:
++        for chunk in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++def iter_source_files(root: Path):
++    files = []
++    for d, dirs, names in os.walk(root):
++        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
++        for n in names:
++            if n.startswith("~$") or n.endswith(SKIP_SUFFIXES):
++                continue
++            files.append(Path(d) / n)
++    return files
++
++def needs_copy(src: Path, dst: Path) -> bool:
++    if not dst.exists():
++        return True
++    s, d = src.stat(), dst.stat()
++    if s.st_size == d.st_size and abs(s.st_mtime - d.st_mtime) <= 2:
++        return False
++    return sha256_file(src) != sha256_file(dst)
++
++def main():
++    source = Path(sys.argv[1]); dest = Path(sys.argv[2])
++    new, changed, total = [], [], 0
++    for src in iter_source_files(source):
++        total += 1
++        dst = dest / src.relative_to(source)
++        if not dst.exists():
++            new.append(src.relative_to(source).as_posix())
++        elif needs_copy(src, dst):
++            changed.append(src.relative_to(source).as_posix())
++    print(f"Working-folder files scanned: {total}")
++    print(f"NEW (never synced): {len(new)}")
++    print(f"CHANGED since last sync: {len(changed)}")
++    print(f"=> Brain is {'OUTDATED' if (new or changed) else 'UP TO DATE'} ({len(new)+len(changed)} files behind)")
++    def show(label, items):
++        if items:
++            print(f"\n--- {label} ({len(items)}) ---")
++            for x in sorted(items)[:40]:
++                print("  " + x)
++            if len(items) > 40:
++                print(f"  ... +{len(items)-40} more")
++    show("NEW", new); show("CHANGED", changed)
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/clean_brain_index.py b/scripts/clean_brain_index.py
+new file mode 100644
+index 0000000..bba2731
+--- /dev/null
++++ b/scripts/clean_brain_index.py
+@@ -0,0 +1,141 @@
++from __future__ import annotations
++
++"""Clean an existing brain's INDEX without touching the SSD backup.
++
++A brain's vault holds two things side by side:
++  * `_source_files/<project>/...`        — the raw backup (everything copied)
++  * `*.neurovault.md` sidecars + `.md`   — what NeuroVault actually INDEXES
++
++Over time a brain can get bloated with sidecars for files that are not real
++knowledge — per-post screenshots, thumbnails, bulk machine-data JSON — which
++blow up the note/chunk count and make the graph view unusable. This tool finds
++those sidecars (using the SAME rules the importer now uses to decide what to
++back-up-but-not-index: `INDEX_EXCLUDE_DIRS` + the project's `.neurovaultignore`)
++and DELETES ONLY THE SIDECARS. The raw files stay on the SSD, fully backed up.
++
++After running this, trigger `/api/update` for the brain so the app soft-deletes
++the now-missing sidecar notes; the brain shrinks to just its real knowledge.
++
++Usage:
++  python scripts/clean_brain_index.py --brain-id competitor-insights-pwc --dry-run
++  python scripts/clean_brain_index.py --brain-id competitor-insights-pwc
++"""
++
++import argparse
++import json
++from pathlib import Path
++
++from import_project_vault import (
++    INDEX_EXCLUDE_DIRS,
++    NO_INDEX_FILE,
++    is_index_excluded,
++    load_no_index_patterns,
++)
++
++SIDECAR_SUFFIXES = (".neurovault.md", ".neurovault.html")
++
++
++def _is_sidecar(path: Path) -> bool:
++    return path.name.lower().endswith(SIDECAR_SUFFIXES)
++
++
++def scan_brain(vault: Path, extra_patterns: list[str] | None = None) -> dict:
++    """Find sidecars that index backup-only files (screenshots/thumbs/.neurovaultignore).
++    Returns the list of sidecars to remove + the raw bytes that stay backed up.
++    `extra_patterns` are merged on top of each project's own .neurovaultignore — use it
++    to apply the LIVE source's ignore rules before they've been re-imported."""
++    extra_patterns = extra_patterns or []
++    source_root = vault / "_source_files"
++    targets: list[dict] = []
++    if not source_root.is_dir():
++        return {"targets": targets, "projects": []}
++
++    projects = [p for p in source_root.iterdir() if p.is_dir()]
++    for project in projects:
++        patterns = load_no_index_patterns(project) + extra_patterns
++        for raw in project.rglob("*"):
++            if not raw.is_file() or _is_sidecar(raw):
++                continue
++            rel = raw.relative_to(project).as_posix()
++            if not is_index_excluded(rel, patterns):
++                continue
++            # The importer names the sidecar "<original name>.neurovault.md".
++            sidecar = raw.with_name(raw.name + ".neurovault.md")
++            if sidecar.is_file():
++                targets.append(
++                    {
++                        "project": project.name,
++                        "raw": rel,
++                        "sidecar": sidecar.relative_to(vault).as_posix(),
++                        "raw_bytes": raw.stat().st_size,
++                    }
++                )
++            elif raw.suffix.lower() == ".md":
++                # A .md original is indexed directly (no sidecar). Removing it would
++                # also remove the backup, so we never delete it — just flag it.
++                targets.append(
++                    {
++                        "project": project.name,
++                        "raw": rel,
++                        "sidecar": "",
++                        "raw_bytes": raw.stat().st_size,
++                        "note": "indexed .md original — left in place (would lose backup)",
++                    }
++                )
++    return {"targets": targets, "projects": [p.name for p in projects]}
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(
++        description="De-index backup-only junk (screenshots/thumbs/.neurovaultignore) from a brain, keeping the SSD backup."
++    )
++    parser.add_argument("--brain-id", required=True)
++    parser.add_argument("--nv-home", default=r"D:\NEURO-VAULT-STORAGE\.neurovault")
++    parser.add_argument("--dry-run", action="store_true", help="Report what would be removed; change nothing.")
++    parser.add_argument("--source", help="Live project folder: read its .neurovaultignore and apply those rules now (before any re-import).")
++    parser.add_argument("--pattern", action="append", default=[], help="Extra backup-only path/glob to de-index (repeatable).")
++    args = parser.parse_args()
++
++    nv_home = Path(args.nv_home)
++    vault = nv_home / "brains" / args.brain_id / "vault"
++    if not vault.is_dir():
++        raise SystemExit(f"brain vault not found: {vault}")
++
++    extra_patterns = list(args.pattern)
++    if args.source:
++        extra_patterns += load_no_index_patterns(Path(args.source))
++
++    result = scan_brain(vault, extra_patterns)
++    removable = [t for t in result["targets"] if t["sidecar"]]
++    skipped_md = [t for t in result["targets"] if not t["sidecar"]]
++    freed = sum(t["raw_bytes"] for t in removable)
++
++    removed = 0
++    if not args.dry_run:
++        for t in removable:
++            sidecar = vault / t["sidecar"]
++            try:
++                sidecar.unlink()
++                removed += 1
++            except FileNotFoundError:
++                pass
++
++    summary = {
++        "brain_id": args.brain_id,
++        "vault": str(vault),
++        "projects": result["projects"],
++        "index_exclude_dirs": sorted(INDEX_EXCLUDE_DIRS),
++        "no_index_file": NO_INDEX_FILE,
++        "sidecars_found": len(removable),
++        "sidecars_removed": removed,
++        "indexed_md_left_in_place": len(skipped_md),
++        "raw_bytes_still_backed_up": freed,
++        "dry_run": args.dry_run,
++        "next_step": f'curl -s -X POST http://127.0.0.1:8765/api/update -H "Content-Type: application/json" -d \'{{"brain":"{args.brain_id}"}}\'  then poll /api/brains/{args.brain_id}/stats',
++    }
++    print(json.dumps(summary, ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/import_project_vault.py b/scripts/import_project_vault.py
+new file mode 100644
+index 0000000..4585362
+--- /dev/null
++++ b/scripts/import_project_vault.py
+@@ -0,0 +1,592 @@
++from __future__ import annotations
++
++import argparse
++import csv
++import fnmatch
++import hashlib
++import html
++import json
++import mimetypes
++import os
++import re
++import shutil
++import zipfile
++from datetime import datetime, timezone
++from pathlib import Path
++
++
++SKIP_DIRS = {
++    ".claude",
++    ".git",
++    ".hg",
++    ".svn",
++    ".next",
++    ".nuxt",
++    ".turbo",
++    ".vite",
++    ".venv",
++    "__pycache__",
++    "build",
++    "cache",
++    "coverage",
++    "cuda_outputs",
++    "dist",
++    "downloads",
++    "external-repos",
++    "node_modules",
++    "logs",
++    "live_backups",
++    "memory_backups",
++    "models",
++    "outputs",
++    "pip_cache",
++    "release",
++    "target",
++    "uploads",
++    "venv",
++    "venv_cuda",
++    "MegaGym-Website",
++}
++
++SKIP_SUFFIXES = (
++    ".neurovault.md",
++    ".neurovault.html",
++)
++
++SKIP_FILENAMES = {
++    ".env",
++    ".env.local",
++    ".env.development.local",
++    ".env.test.local",
++    ".env.production.local",
++    ".git",
++    ".skill-optimizer-ran",
++    ".cache",
++    ".metadata_cache.json",
++    "bun.lockb",
++    "libraries.json",
++    "package-lock.json",
++    "pnpm-lock.yaml",
++    "transcribepro-macos-buildkit.zip",
++    "transcribepro-windows-installer.zip",
++    "yarn.lock",
++    "youtube_cookies.txt",
++}
++
++SKIP_EXTS = {
++    ".mp4",
++    ".zip",
++}
++
++# Dirs whose files are BACKED UP (copied to _source_files on the SSD) but NOT indexed
++# into the brain — regenerable/binary output (screenshots, thumbnails, captures) that
++# would only bloat recall and blow up the knowledge graph. A project can add its own
++# backup-only paths via a `.neurovaultignore` file in its root (newline-separated
++# relative paths/globs, same copy-but-don't-index semantics) — e.g. a scraper's
++# `data/` output folder full of captured JSON.
++INDEX_EXCLUDE_DIRS = {
++    "screenshots", "screenshot", "screen_shots", "_screenshots",
++    "thumbs", "thumbnails", "thumbnail",
++    "captures",
++}
++NO_INDEX_FILE = ".neurovaultignore"
++
++TEXT_EXTS = {
++    "",
++    ".babelrc",
++    ".css",
++    ".csv",
++    ".cc",
++    ".cmake",
++    ".cpp",
++    ".dart",
++    ".entitlements",
++    ".env",
++    ".gradle",
++    ".gitignore",
++    ".h",
++    ".htm",
++    ".html",
++    ".iml",
++    ".ini",
++    ".java",
++    ".js",
++    ".json",
++    ".jsx",
++    ".kt",
++    ".kts",
++    ".lock",
++    ".log",
++    ".m",
++    ".manifest",
++    ".md",
++    ".mjs",
++    ".pbxproj",
++    ".plist",
++    ".properties",
++    ".ps1",
++    ".py",
++    ".rc",
++    ".sample",
++    ".scss",
++    ".sh",
++    ".storyboard",
++    ".swift",
++    ".svg",
++    ".toml",
++    ".ts",
++    ".tsx",
++    ".txt",
++    ".vue",
++    ".xcconfig",
++    ".xcsettings",
++    ".xcscheme",
++    ".xcworkspacedata",
++    ".xml",
++    ".yaml",
++    ".yml",
++}
++
++LANG_BY_EXT = {
++    ".css": "css",
++    ".csv": "csv",
++    ".cc": "cpp",
++    ".cmake": "cmake",
++    ".cpp": "cpp",
++    ".dart": "dart",
++    ".html": "html",
++    ".htm": "html",
++    ".java": "java",
++    ".js": "javascript",
++    ".jsx": "jsx",
++    ".kt": "kotlin",
++    ".kts": "kotlin",
++    ".m": "objective-c",
++    ".json": "json",
++    ".md": "markdown",
++    ".mjs": "javascript",
++    ".plist": "xml",
++    ".properties": "properties",
++    ".ps1": "powershell",
++    ".py": "python",
++    ".scss": "scss",
++    ".sh": "bash",
++    ".swift": "swift",
++    ".svg": "xml",
++    ".toml": "toml",
++    ".ts": "typescript",
++    ".tsx": "tsx",
++    ".vue": "vue",
++    ".xml": "xml",
++    ".yaml": "yaml",
++    ".yml": "yaml",
++}
++
++
++def slugify(value: str) -> str:
++    slug = re.sub(r"[^A-Za-z0-9]+", "-", value.strip()).strip("-").lower()
++    return slug or "project"
++
++
++def now_utc() -> str:
++    return datetime.now(timezone.utc).isoformat()
++
++
++def read_text_guess(path: Path) -> str:
++    data = path.read_bytes()
++    for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
++        try:
++            return data.decode(enc)
++        except UnicodeDecodeError:
++            continue
++    return data.decode("utf-8", errors="replace")
++
++
++def normalize_newlines(text: str) -> str:
++    text = text.replace("\r\n", "\n").replace("\r", "\n")
++    return re.sub(r"\n{4,}", "\n\n\n", text).strip()
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def yaml_string(value: str) -> str:
++    return json.dumps(value, ensure_ascii=False)
++
++
++def frontmatter(source_rel: str, source_path: Path, digest: str, mode: str) -> str:
++    stat = source_path.stat()
++    return (
++        "---\n"
++        f"source_path: {yaml_string(source_rel)}\n"
++        f"source_sha256: {yaml_string(digest)}\n"
++        f"source_bytes: {stat.st_size}\n"
++        f"source_modified_utc: {yaml_string(datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat())}\n"
++        f"conversion_mode: {yaml_string(mode)}\n"
++        "---\n\n"
++    )
++
++
++def code_markdown(source_rel: str, path: Path, digest: str, text: str) -> str:
++    lang = LANG_BY_EXT.get(path.suffix.lower(), "")
++    fence = "```"
++    while fence in text:
++        fence += "`"
++    return (
++        frontmatter(source_rel, path, digest, "text-code")
++        + f"# Source File: {source_rel}\n\n"
++        + "Original file is preserved beside this generated markdown sidecar.\n\n"
++        + f"Original SHA-256: `{digest}`\n\n"
++        + "## Content\n\n"
++        + f"{fence}{lang}\n{text.rstrip()}\n{fence}\n"
++    )
++
++
++def html_text_markdown(source_rel: str, path: Path, digest: str, text: str) -> str:
++    stripped = re.sub(r"(?is)<(script|style).*?</\1>", "\n", text)
++    stripped = re.sub(r"(?is)<br\s*/?>", "\n", stripped)
++    stripped = re.sub(r"(?is)</(p|div|h[1-6]|li|tr|table)>", "\n", stripped)
++    stripped = re.sub(r"(?is)<[^>]+>", " ", stripped)
++    stripped = normalize_newlines(html.unescape(re.sub(r"[ \t]+", " ", stripped)))
++    return (
++        frontmatter(source_rel, path, digest, "html-text")
++        + f"# HTML File: {source_rel}\n\n"
++        + "Original file is preserved beside this generated markdown sidecar.\n\n"
++        + f"Original SHA-256: `{digest}`\n\n"
++        + "## Extracted Text\n\n"
++        + (stripped or "[No visible text extracted.]")
++        + "\n\n## Raw HTML\n\n"
++        + "```html\n"
++        + text.rstrip()
++        + "\n```\n"
++    )
++
++
++def binary_markdown(source_rel: str, path: Path, digest: str) -> str:
++    mime, _ = mimetypes.guess_type(path.name)
++    return (
++        frontmatter(source_rel, path, digest, "binary-metadata")
++        + f"# Binary Asset: {source_rel}\n\n"
++        + "Original file is preserved beside this generated metadata note.\n\n"
++        + f"- SHA-256: `{digest}`\n"
++        + f"- Bytes: `{path.stat().st_size}`\n"
++        + f"- MIME guess: `{mime or 'unknown'}`\n"
++    )
++
++
++def write_markdown_for_file(source_rel: str, path: Path) -> tuple[Path, str, int, str]:
++    digest = sha256_file(path)
++    ext = path.suffix.lower()
++    if ext == ".md":
++        try:
++            chars = len(read_text_guess(path))
++        except Exception:
++            chars = 0
++        return path, "markdown-original", chars, digest
++    if ext in {".html", ".htm"}:
++        text = normalize_newlines(read_text_guess(path))
++        md_path = path.with_name(f"{path.name}.neurovault.md")
++        md_path.write_text(html_text_markdown(source_rel, path, digest, text), encoding="utf-8")
++        return md_path, "html-text", len(text), digest
++    if ext in TEXT_EXTS:
++        text = normalize_newlines(read_text_guess(path))
++        md_path = path.with_name(f"{path.name}.neurovault.md")
++        md_path.write_text(code_markdown(source_rel, path, digest, text), encoding="utf-8")
++        return md_path, "text-code", len(text), digest
++    md_path = path.with_name(f"{path.name}.neurovault.md")
++    md_path.write_text(binary_markdown(source_rel, path, digest), encoding="utf-8")
++    return md_path, "binary-metadata", 0, digest
++
++
++def should_skip_dir(path: Path, extra_skip_dirs: set[str] | None = None) -> bool:
++    extra_skip_dirs = extra_skip_dirs or set()
++    return path.name in SKIP_DIRS or path.name in extra_skip_dirs or path.name.startswith(".cache")
++
++
++def load_no_index_patterns(source: Path) -> list[str]:
++    """Read <source>/.neurovaultignore: newline-separated relative paths/globs of files
++    to BACK UP (copy to the SSD) but NOT index into the brain. Blank lines and #-comments
++    are ignored. Lets a project keep bulk data/outputs out of recall + the knowledge graph
++    while still preserving them on the SSD."""
++    f = source / NO_INDEX_FILE
++    pats: list[str] = []
++    if f.is_file():
++        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
++            s = line.strip()
++            if s and not s.startswith("#"):
++                pats.append(s.replace("\\", "/").rstrip("/"))
++    return pats
++
++
++def is_index_excluded(rel: str, no_index_patterns: list[str]) -> bool:
++    """True if this file should be copied-but-NOT-indexed: it lives under an
++    INDEX_EXCLUDE_DIRS folder, or matches a `.neurovaultignore` pattern (path prefix
++    or glob). The file is still backed up to _source_files; it just gets no sidecar,
++    so it never enters the brain's recall or graph."""
++    rel = rel.replace("\\", "/")
++    if any(part in INDEX_EXCLUDE_DIRS for part in rel.split("/")[:-1]):
++        return True
++    for pat in no_index_patterns:
++        if rel == pat or rel.startswith(pat + "/") or fnmatch.fnmatch(rel, pat):
++            return True
++    return False
++
++
++def safe_zip_member(name: str) -> bool:
++    parts = Path(name.replace("\\", "/")).parts
++    return bool(parts) and not any(part in {"", ".", ".."} for part in parts)
++
++
++def iter_source_files(
++    source: Path,
++    extra_skip_dirs: set[str] | None = None,
++    extra_skip_filenames: set[str] | None = None,
++    extra_skip_exts: set[str] | None = None,
++) -> list[Path]:
++    extra_skip_dirs = extra_skip_dirs or set()
++    extra_skip_filenames = extra_skip_filenames or set()
++    extra_skip_exts = extra_skip_exts or set()
++    out: list[Path] = []
++    for root, dirs, files in os.walk(source):
++        root_path = Path(root)
++        dirs[:] = [d for d in dirs if not should_skip_dir(root_path / d, extra_skip_dirs)]
++        for name in files:
++            if name.startswith("~$") or name.lower().endswith(SKIP_SUFFIXES):
++                continue
++            if Path(name).suffix.lower() in SKIP_EXTS | extra_skip_exts:
++                continue
++            if name.lower() in SKIP_FILENAMES | extra_skip_filenames:
++                continue
++            out.append(root_path / name)
++    return sorted(out, key=lambda p: p.relative_to(source).as_posix().lower())
++
++
++def ensure_registry(nv_home: Path, brain_id: str, name: str, description: str, make_active: bool) -> None:
++    registry_path = nv_home / "brains.json"
++    data = json.loads(registry_path.read_text(encoding="utf-8"))
++    brains = data.setdefault("brains", [])
++    existing = next((b for b in brains if b.get("id") == brain_id), None)
++    if existing is None:
++        brains.append(
++            {
++                "created_at": now_utc(),
++                "description": description,
++                "id": brain_id,
++                "name": name,
++            }
++        )
++    else:
++        existing["name"] = name
++        existing["description"] = description
++    if make_active:
++        data["active"] = brain_id
++    tmp = registry_path.with_suffix(".json.tmp")
++    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++    tmp.replace(registry_path)
++
++
++def import_project(
++    source: Path,
++    nv_home: Path,
++    brain_id: str,
++    name: str,
++    make_active: bool,
++    extra_skip_dirs: set[str] | None = None,
++    extra_skip_filenames: set[str] | None = None,
++    extra_skip_exts: set[str] | None = None,
++) -> dict:
++    description = f"Project archive cloned from {source}"
++    ensure_registry(nv_home, brain_id, name, description, make_active)
++
++    vault = nv_home / "brains" / brain_id / "vault"
++    raw_root = vault / "_source_files" / source.name
++    report_root = vault / "_neurovault_index"
++    raw_root.mkdir(parents=True, exist_ok=True)
++    report_root.mkdir(parents=True, exist_ok=True)
++
++    no_index_patterns = load_no_index_patterns(source)
++    rows: list[dict[str, str | int]] = []
++    copied = 0
++    converted = 0
++    binary = 0
++    existing_md = 0
++    not_indexed = 0
++
++    for src in iter_source_files(source, extra_skip_dirs, extra_skip_filenames, extra_skip_exts):
++        rel = src.relative_to(source).as_posix()
++        dst = raw_root / rel
++        dst.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(src, dst)
++        copied += 1
++
++        # Backup-only (copied to the SSD, but NOT indexed): keeps regenerable output and
++        # bulk data out of the brain's recall + graph. No sidecar is written for these.
++        if is_index_excluded(rel, no_index_patterns):
++            not_indexed += 1
++            rows.append({
++                "relative_path": rel, "extension": dst.suffix.lower(),
++                "bytes": dst.stat().st_size, "sha256": "",
++                "mode": "backup-only-no-index", "text_chars": 0, "markdown_path": "",
++            })
++            continue
++
++        md_path, mode, chars, digest = write_markdown_for_file(rel, dst)
++        ext = dst.suffix.lower()
++        if mode == "markdown-original":
++            existing_md += 1
++        elif mode in {"html-text", "text-code"}:
++            converted += 1
++        else:
++            binary += 1
++
++        rows.append(
++            {
++                "relative_path": rel,
++                "extension": ext,
++                "bytes": dst.stat().st_size,
++                "sha256": digest,
++                "mode": mode,
++                "text_chars": chars,
++                "markdown_path": md_path.relative_to(vault).as_posix(),
++            }
++        )
++
++        if ext == ".zip":
++            archive_slug = slugify(Path(rel).stem)
++            extract_root = raw_root / "_extracted_archives" / archive_slug
++            with zipfile.ZipFile(dst) as archive:
++                for member in archive.infolist():
++                    if member.is_dir() or not safe_zip_member(member.filename):
++                        continue
++                    member_rel = Path(member.filename.replace("\\", "/"))
++                    if any(part in SKIP_DIRS or part.startswith(".cache") for part in member_rel.parts):
++                        continue
++                    if member_rel.name.lower() in SKIP_FILENAMES:
++                        continue
++                    extracted = extract_root / member_rel
++                    extracted.parent.mkdir(parents=True, exist_ok=True)
++                    with archive.open(member) as src_handle, extracted.open("wb") as dst_handle:
++                        shutil.copyfileobj(src_handle, dst_handle)
++                    copied += 1
++                    extracted_rel = (
++                        Path("_source_files")
++                        / source.name
++                        / "_extracted_archives"
++                        / archive_slug
++                        / member_rel
++                    ).as_posix()
++                    archive_source_rel = f"{rel}!/{member.filename}"
++                    emd_path, emode, echars, edigest = write_markdown_for_file(
++                        archive_source_rel,
++                        extracted,
++                    )
++                    if emode == "markdown-original":
++                        existing_md += 1
++                    elif emode in {"html-text", "text-code"}:
++                        converted += 1
++                    else:
++                        binary += 1
++                    rows.append(
++                        {
++                            "relative_path": archive_source_rel,
++                            "extension": extracted.suffix.lower(),
++                            "bytes": extracted.stat().st_size,
++                            "sha256": edigest,
++                            "mode": f"zip-{emode}",
++                            "text_chars": echars,
++                            "markdown_path": emd_path.relative_to(vault).as_posix(),
++                        }
++                    )
++
++    csv_path = report_root / "project_import_report.csv"
++    with csv_path.open("w", encoding="utf-8", newline="") as handle:
++        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()) if rows else [])
++        if rows:
++            writer.writeheader()
++            writer.writerows(rows)
++
++    md_report = report_root / "00_PROJECT_IMPORT_OVERVIEW.md"
++    with md_report.open("w", encoding="utf-8") as handle:
++        handle.write(f"# Project Import: {name}\n\n")
++        handle.write(f"Generated: {now_utc()}\n\n")
++        handle.write(f"Source: `{source}`\n\n")
++        handle.write(f"Brain ID: `{brain_id}`\n\n")
++        handle.write("## Summary\n\n")
++        handle.write(f"- Files copied: {copied}\n")
++        handle.write(f"- Existing markdown files preserved: {existing_md}\n")
++        handle.write(f"- Text/code/html files converted to markdown sidecars: {converted}\n")
++        handle.write(f"- Binary assets represented by metadata notes: {binary}\n")
++        handle.write(f"- Backed up but NOT indexed (screenshots/thumbs/.neurovaultignore): {not_indexed}\n\n")
++        handle.write("Original files are preserved under `_source_files/`; generated markdown sidecars are what NeuroVault indexes. Backup-only files are copied to the SSD but get no sidecar, so they never enter recall or the knowledge graph.\n\n")
++        handle.write("## Files\n\n")
++        handle.write("| Source | Mode | Bytes | Markdown |\n")
++        handle.write("|---|---|---:|---|\n")
++        for row in rows:
++            handle.write(
++                f"| `{row['relative_path']}` | `{row['mode']}` | {row['bytes']} | `{row['markdown_path']}` |\n"
++            )
++
++    return {
++        "brain_id": brain_id,
++        "brain_name": name,
++        "vault": str(vault),
++        "raw_root": str(raw_root),
++        "files_copied": copied,
++        "existing_markdown": existing_md,
++        "converted_sidecars": converted,
++        "binary_metadata_notes": binary,
++        "backup_only_not_indexed": not_indexed,
++        "report": str(md_report),
++        "csv": str(csv_path),
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description="Import a project folder into a NeuroVault brain.")
++    parser.add_argument("--source", required=True)
++    parser.add_argument("--nv-home", default=r"D:\NEURO-VAULT-STORAGE\.neurovault")
++    parser.add_argument("--brain-id")
++    parser.add_argument("--name")
++    parser.add_argument("--active", action="store_true")
++    parser.add_argument("--skip-dir", action="append", default=[], help="Additional directory basename to skip.")
++    parser.add_argument("--skip-file", action="append", default=[], help="Additional filename to skip.")
++    parser.add_argument("--skip-ext", action="append", default=[], help="Additional extension to skip, such as .png.")
++    args = parser.parse_args()
++
++    source = Path(args.source).resolve()
++    nv_home = Path(args.nv_home)
++    if not source.is_dir():
++        raise SystemExit(f"source folder not found: {source}")
++    if not (nv_home / "brains.json").is_file():
++        raise SystemExit(f"NeuroVault home not found: {nv_home}")
++
++    name = args.name or source.name
++    brain_id = args.brain_id or slugify(name)
++    extra_skip_dirs = set(args.skip_dir)
++    extra_skip_filenames = {name.lower() for name in args.skip_file}
++    extra_skip_exts = {
++        ext.lower() if ext.startswith(".") else f".{ext.lower()}"
++        for ext in args.skip_ext
++    }
++
++    result = import_project(
++        source,
++        nv_home,
++        brain_id,
++        name,
++        args.active,
++        extra_skip_dirs,
++        extra_skip_filenames,
++        extra_skip_exts,
++    )
++    print(json.dumps(result, ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/thesis_incremental_refresh.py b/scripts/thesis_incremental_refresh.py
+new file mode 100644
+index 0000000..f6c5552
+--- /dev/null
++++ b/scripts/thesis_incremental_refresh.py
+@@ -0,0 +1,181 @@
++from __future__ import annotations
++
++import hashlib
++import html
++import json
++import os
++import re
++import shutil
++import zipfile
++from datetime import datetime, timezone
++from pathlib import Path
++import xml.etree.ElementTree as ET
++
++
++SOURCE_ROOT = Path(r"C:\Users\steli\Desktop\PwC\uni (thesis)")
++VAULT_ROOT = Path(r"D:\NEURO-VAULT-STORAGE\.neurovault\brains\thesis\vault")
++DEST_ROOT = VAULT_ROOT / "_source_files" / "uni (thesis)"
++REPORT_ROOT = VAULT_ROOT / "_neurovault_index"
++
++SKIP_DIRS = {".git", ".claude", "__pycache__"}
++SKIP_NAMES = {
++    ".mcp.json",
++    ".mcp.json.pre-v031-switch-20260531-1305.bak",
++}
++SKIP_SUFFIXES = (".neurovault.md", ".neurovault.html", ".mammoth.html")
++
++DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def iter_source_files() -> list[Path]:
++    files: list[Path] = []
++    for root, dirs, names in os.walk(SOURCE_ROOT):
++        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
++        root_path = Path(root)
++        for name in names:
++            if name.startswith("~$") or name in SKIP_NAMES or name.endswith(SKIP_SUFFIXES):
++                continue
++            files.append(root_path / name)
++    return sorted(files, key=lambda p: p.relative_to(SOURCE_ROOT).as_posix().lower())
++
++
++def needs_copy(src: Path, dst: Path) -> bool:
++    if not dst.exists():
++        return True
++    src_stat = src.stat()
++    dst_stat = dst.stat()
++    if src_stat.st_size == dst_stat.st_size and abs(src_stat.st_mtime - dst_stat.st_mtime) <= 2:
++        return False
++    return sha256_file(src) != sha256_file(dst)
++
++
++def docx_text(path: Path) -> str:
++    parts: list[str] = []
++    with zipfile.ZipFile(path) as archive:
++        for name in ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"):
++            if name not in archive.namelist():
++                continue
++            root = ET.fromstring(archive.read(name))
++            if name != "word/document.xml":
++                parts.append(f"\n## {Path(name).stem.title()}\n")
++            for para in root.findall(".//w:p", DOCX_NS):
++                texts: list[str] = []
++                for node in para.iter():
++                    tag = node.tag.rsplit("}", 1)[-1]
++                    if tag == "t" and node.text:
++                        texts.append(node.text)
++                    elif tag == "tab":
++                        texts.append("\t")
++                    elif tag == "br":
++                        texts.append("\n")
++                line = "".join(texts).strip()
++                if line:
++                    parts.append(line)
++    text = "\n\n".join(parts)
++    return re.sub(r"\n{4,}", "\n\n\n", text).strip() or "[No text extracted from DOCX.]"
++
++
++def write_docx_sidecars(rel: str, dst: Path) -> tuple[Path, int, str]:
++    digest = sha256_file(dst)
++    stat = dst.stat()
++    text = docx_text(dst)
++    frontmatter = (
++        "---\n"
++        f"source_path: {json.dumps(rel, ensure_ascii=False)}\n"
++        f"source_sha256: {json.dumps(digest)}\n"
++        f"source_bytes: {stat.st_size}\n"
++        f"source_modified_utc: {json.dumps(datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat())}\n"
++        'conversion_mode: "docx-xml-text"\n'
++        "---\n\n"
++    )
++    md = (
++        frontmatter
++        + f"# NeuroVault Conversion: {rel}\n\n"
++        + "This sidecar was generated during a thesis incremental refresh. "
++        + "Original file is preserved beside this generated markdown sidecar.\n\n"
++        + f"Original SHA-256: `{digest}`\n\n"
++        + "## Extracted Text\n\n"
++        + text
++        + "\n"
++    )
++    md_path = dst.with_name(f"{dst.name}.neurovault.md")
++    md_path.write_text(md, encoding="utf-8")
++
++    html_path = dst.with_name(f"{dst.name}.neurovault.html")
++    html_path.write_text(
++        "<!doctype html><meta charset=\"utf-8\">"
++        f"<title>{html.escape(rel)}</title>"
++        f"<h1>NeuroVault Conversion: {html.escape(rel)}</h1>"
++        f"<pre>{html.escape(text)}</pre>",
++        encoding="utf-8",
++    )
++    return md_path, len(text), digest
++
++
++def main() -> int:
++    if not SOURCE_ROOT.is_dir():
++        raise SystemExit(f"Missing source thesis folder: {SOURCE_ROOT}")
++    if not DEST_ROOT.is_dir():
++        raise SystemExit(f"Missing SSD thesis clone: {DEST_ROOT}")
++
++    REPORT_ROOT.mkdir(parents=True, exist_ok=True)
++    rows: list[dict[str, object]] = []
++
++    for src in iter_source_files():
++        rel = src.relative_to(SOURCE_ROOT).as_posix()
++        dst = DEST_ROOT / rel
++        if not needs_copy(src, dst):
++            continue
++        dst.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(src, dst)
++        digest = sha256_file(dst)
++        mode = "binary-copied"
++        chars = 0
++        markdown_path = ""
++        if dst.suffix.lower() == ".docx":
++            md_path, chars, digest = write_docx_sidecars(rel, dst)
++            mode = "docx-xml-text"
++            markdown_path = md_path.relative_to(VAULT_ROOT).as_posix()
++        elif dst.suffix.lower() == ".md":
++            mode = "markdown-original"
++            markdown_path = dst.relative_to(VAULT_ROOT).as_posix()
++            chars = len(dst.read_text(encoding="utf-8", errors="replace"))
++
++        rows.append(
++            {
++                "relative_path": rel,
++                "mode": mode,
++                "bytes": dst.stat().st_size,
++                "sha256": digest,
++                "text_chars": chars,
++                "markdown_path": markdown_path,
++            }
++        )
++
++    report = REPORT_ROOT / f"thesis_incremental_update_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.md"
++    with report.open("w", encoding="utf-8") as handle:
++        handle.write("# Thesis Incremental Update\n\n")
++        handle.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
++        handle.write(f"Source: `{SOURCE_ROOT}`\n\n")
++        handle.write("Copied new/changed files into the SSD thesis vault and generated searchable sidecars for new DOCX files.\n\n")
++        handle.write("| Source | Mode | Bytes | Markdown |\n")
++        handle.write("|---|---|---:|---|\n")
++        for row in rows:
++            handle.write(
++                f"| `{row['relative_path']}` | `{row['mode']}` | {row['bytes']} | `{row['markdown_path']}` |\n"
++            )
++
++    print(json.dumps({"copied_or_changed": len(rows), "report": str(report), "rows": rows}, indent=2, ensure_ascii=False))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index 8b7aebc..b3943b6 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -8,7 +8,9 @@
+     "shell:default",
+     "dialog:allow-open",
+     "dialog:allow-save",
++    "dialog:allow-ask",
+     "updater:default",
+-    "process:allow-restart"
++    "process:allow-restart",
++    "process:allow-exit"
+   ]
+ }
+diff --git a/src-tauri/src/app.rs b/src-tauri/src/app.rs
+index 3514553..6d06807 100644
+--- a/src-tauri/src/app.rs
++++ b/src-tauri/src/app.rs
+@@ -912,29 +912,10 @@ fn reveal_in_file_manager(path: String) -> Result<(), String> {
+     }
+ }
+ 
+-/// Tell the user ONCE that closing the window did not stop memory.
+-/// Delivered as an OS notification because the window is already hidden
+-/// (an in-app toast would be invisible). Flag lives next to the other
+-/// app state so it survives restarts; failures are silent — a missing
+-/// hint must never break closing a window.
+-fn notify_hidden_once() {
+-    let flag = crate::memory::paths::nv_home().join(".close-hint-shown");
+-    if flag.exists() {
+-        return;
+-    }
+-    let _ = fs::create_dir_all(flag.parent().unwrap_or(&flag));
+-    let _ = fs::write(&flag, "1");
+-    #[cfg(target_os = "macos")]
+-    {
+-        let _ = std::process::Command::new("osascript")
+-            .arg("-e")
+-            .arg(
+-                "display notification \"Memory keeps running in the background. \
+-                 Reopen from the Dock, or quit to stop it.\" with title \"NeuroVault\"",
+-            )
+-            .spawn();
+-    }
+-}
++// (Upstream's `notify_hidden_once` lived here: a one-time OS notification
++// saying memory keeps running after the window is closed. Removed with the
++// local close-quits-the-app deviation above — closing no longer backgrounds
++// the app, so the hint would be untrue.)
+ 
+ /// Hide the main window without quitting the app. The sidecar keeps running
+ /// and the user can restore via Cmd+Shift+Space on macOS or Ctrl+Shift+Space
+@@ -1379,6 +1360,67 @@ fn nv_supersede_note(
+     memory::supersede_note(&db, &old_id, &new_id, reason.as_deref()).map_err(|e| e.to_string())
+ }
+ 
++/// Safely flush + eject the external SSD that hosts the brain vault.
++///
++/// The SSD is an organized clone of source material that also lives on C:, so
++/// no off-drive copy is made — the eject just makes the on-disk database
++/// consistent, then releases the drive.
++///
++/// Steps, in order:
++///   1. Trigger the pre-registered "NeuroVault-Eject" scheduled task. A task
++///      runs outside this app's process tree, so it SURVIVES the app closing —
++///      a spawned child gets killed the moment the app exits, which is why an
++///      inline helper never finished. The task also runs elevated, so ejecting
++///      a Fixed-type USB SSD isn't blocked. Its script waits for this process
++///      to exit, then calls CM_Request_Device_Eject (which PRESERVES the drive
++///      letter for replug) and re-arms the auto-open watcher. Triggered FIRST
++///      so a missing-task failure aborts with no side effects.
++///   2. Stop the vault watchers so nothing writes during the checkpoint.
++///   3. WAL-checkpoint every open brain so `brain.db` is fully written.
++///   4. Drop all cached DB handles (unmaps the 256 MiB mmap, closes the files).
++///
++/// Returns a human-readable summary the UI can toast. Errors leave the drive
++/// un-ejected; the data is still flushed and safe on the SSD.
++#[tauri::command]
++fn nv_eject_ssd_brain() -> std::result::Result<String, String> {
++    let home = memory::paths::nv_home();
++    let home_str = home.to_string_lossy().to_string();
++    // Drive letter like "D:" from the brain-home path prefix.
++    let drive = if home_str.len() >= 2 && home_str.as_bytes()[1] == b':' {
++        home_str[..2].to_uppercase()
++    } else {
++        return Err("Could not determine the SSD drive letter from the brain home path.".to_string());
++    };
++    if drive == "C:" {
++        return Err(
++            "The active brain is on the system drive (C:), not a removable SSD — nothing to eject."
++                .to_string(),
++        );
++    }
++
++    #[cfg(windows)]
++    {
++        use std::os::windows::process::CommandExt;
++        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++        let status = std::process::Command::new("schtasks")
++            .args(["/Run", "/TN", "NeuroVault-Eject"])
++            .creation_flags(CREATE_NO_WINDOW)
++            .status()
++            .map_err(|e| format!("Could not start the eject task: {e}"))?;
++        if !status.success() {
++            return Err(
++                "Eject task isn't registered — run Register-NeuroVault-Eject.ps1 once.".to_string(),
++            );
++        }
++    }
++
++    memory::watcher::stop_all();
++    memory::db::checkpoint_all();
++    memory::db::close_all();
++
++    Ok(format!("Flushed. Safely removing {drive} once NeuroVault closes."))
++}
++
+ // --- Phase-6 recall + HTTP server -------------------------------------
+ 
+ /// Hybrid recall — the main retrieval entry point. Replaces
+@@ -1874,23 +1916,33 @@ pub fn run() {
+         // that still held :8765, with `Reopen` (Dock click) unable to find a
+         // "main" window to restore. The only way out was force-quit.
+         //
+-        // Now: close HIDES. The window always exists, always restores (Dock
+-        // click / Cmd+Shift+Space / the minitab), and memory never dies by
+-        // accident. Only an explicit Quit stops the service — and that still
+-        // runs the ExitRequested cleanup below (checkpoint + close DBs).
++        // Upstream's answer is that close HIDES, keeping the service alive.
++        // LOCAL DEVIATION: here, close QUITS.
++        //
++        // These brains live on an external SSD. A hidden-but-running app keeps
++        // brain.db and SQLite's 256 MiB memory-map open, so Windows refuses to
++        // eject the drive ("still in use") with nothing on screen to explain
++        // why. Quitting is how this machine releases the SSD, so the X has to
++        // actually stop the process.
++        //
++        // This reuses upstream's save-then-quit handshake rather than exiting
++        // behind its back: emit the SAME event the Quit menu item does, so the
++        // frontend flushes the pending save and then calls `quit_after_save`,
++        // which sets ALLOW_EXIT_AFTER_SAVE and lets ExitRequested run the full
++        // cleanup (sidecar, watchers, WAL checkpoint, close DBs). If the save
++        // FAILS, the frontend calls `open_main_window` instead and shows the
++        // retained buffer with Retry — so a failed write still can't lose data.
++        //
++        // The window is hidden immediately so the X feels instant; the process
++        // exits a moment later once the flush lands. To keep memory serving
++        // agents while getting the window off screen, use "shrink to widget"
++        // (which hides without ever raising CloseRequested).
+         .on_window_event(|window, event| {
+             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                 if window.label() == "main" {
+                     api.prevent_close();
+-                    // Closing hides rather than exits, so the flush may finish
+-                    // while hidden. On failure the frontend reopens the window
+-                    // and presents the retained buffer + Retry state.
+-                    let _ = window.emit("neurovault-save-requested", "window-close");
++                    let _ = window.emit("neurovault-save-requested", "quit");
+                     let _ = window.hide();
+-                    // One-time hint, delivered as a SYSTEM notification —
+-                    // an in-app toast would render into the window we just
+-                    // hid, where nobody could read it. Once per install.
+-                    notify_hidden_once();
+                 }
+             }
+         })
+@@ -1931,6 +1983,8 @@ pub fn run() {
+             nv_diagnose,
+             // Engram-level supersession (new note retires a stale one).
+             nv_supersede_note,
++            // Safely flush + release the external SSD hosting the brains.
++            nv_eject_ssd_brain,
+         ])
+         .build(tauri::generate_context!())
+         .expect("error while building tauri application")
+diff --git a/src-tauri/src/memory/paths.rs b/src-tauri/src/memory/paths.rs
+index f2d4dc0..a943c8d 100644
+--- a/src-tauri/src/memory/paths.rs
++++ b/src-tauri/src/memory/paths.rs
+@@ -21,19 +21,30 @@ use std::path::PathBuf;
+ /// 2. `$ENGRAM_HOME` if set (legacy — mirrors Python's backward-compat
+ ///    shim; emits no warning from Rust because the message belongs to
+ ///    the CLI/subprocess layer, not the core library)
+-/// 3. `%USERPROFILE%\.neurovault` on Windows / `~/.neurovault`
++/// 3. a plugged-in NeuroVault SSD, identified by its `brains.json` marker
++///    (see [`plugged_in_ssd_home`])
++/// 4. `%USERPROFILE%\.neurovault` on Windows / `~/.neurovault`
+ ///    elsewhere via the `dirs` crate
++///
++/// Both env vars are trimmed before use. A launcher written as
++/// `set NEUROVAULT_HOME=D:\... && app.exe` captures the space before the
++/// `&&` into the value, which then fails to resolve as a path.
+ pub fn nv_home() -> PathBuf {
+     if let Ok(explicit) = env::var("NEUROVAULT_HOME") {
++        let explicit = explicit.trim();
+         if !explicit.is_empty() {
+             return PathBuf::from(explicit);
+         }
+     }
+     if let Ok(legacy) = env::var("ENGRAM_HOME") {
++        let legacy = legacy.trim();
+         if !legacy.is_empty() {
+             return PathBuf::from(legacy);
+         }
+     }
++    if let Some(ssd_home) = plugged_in_ssd_home() {
++        return ssd_home;
++    }
+     dirs::home_dir()
+         .map(|h| h.join(".neurovault"))
+         // If we can't resolve a home dir at all we fall back to the
+@@ -43,6 +54,37 @@ pub fn nv_home() -> PathBuf {
+         .unwrap_or_else(|| PathBuf::from(".neurovault"))
+ }
+ 
++/// Locate a NeuroVault brain store on a removable drive.
++///
++/// The brains can live on an external SSD that mounts under whatever letter
++/// Windows hands out that day, so the drive is identified by content rather
++/// than by letter: the first drive carrying `<X>:\NEURO-VAULT-STORAGE\.neurovault\brains.json`
++/// wins. `D:` is probed first because that is the usual mount, then A-Z as a
++/// fallback. Returns `None` when no such drive is attached, which lets
++/// [`nv_home`] fall through to the local profile directory.
++///
++/// This lives in `paths` rather than the desktop layer on purpose: the
++/// headless binaries (`neurovault-server`, the MCP forwarder) resolve their
++/// data root through the same function, so plugging the SSD in points every
++/// entry point at the same brains.
++fn plugged_in_ssd_home() -> Option<PathBuf> {
++    #[cfg(windows)]
++    {
++        const MARKER: &str = r"NEURO-VAULT-STORAGE\.neurovault";
++        let preferred = PathBuf::from(format!(r"D:\{MARKER}"));
++        if preferred.join("brains.json").is_file() {
++            return Some(preferred);
++        }
++        for drive in b'A'..=b'Z' {
++            let candidate = PathBuf::from(format!(r"{}:\{MARKER}", drive as char));
++            if candidate.join("brains.json").is_file() {
++                return Some(candidate);
++            }
++        }
++    }
++    None
++}
++
+ /// Directory that holds every brain's per-brain state.
+ pub fn brains_root() -> PathBuf {
+     nv_home().join("brains")
+diff --git a/src-tauri/src/memory/project_import.rs b/src-tauri/src/memory/project_import.rs
+new file mode 100644
+index 0000000..bb1ab77
+--- /dev/null
++++ b/src-tauri/src/memory/project_import.rs
+@@ -0,0 +1,209 @@
++//! Full-project import — the in-app Sync's "import everything like the
++//! `/update-brain` skill" path.
++//!
++//! Where `source_mirror` mirrors only markdown (pure Rust, no Python), this
++//! shells out to the SAME importer the skill uses
++//! (`scripts/import_project_vault.py`): it copies every file into the vault
++//! and writes `.neurovault.md` sidecars for non-markdown (code, html,
++//! binaries). Because it's literally the same code, the output is
++//! byte-identical to `/update-brain`, so the in-app Sync and the skill never
++//! conflict on the same brain. After the importer writes the files we ingest
++//! the vault so the new sidecars become searchable.
++//!
++//! Requires Python on PATH — the same dependency the `/update-brain` skill
++//! already needs. Only invoked when the user explicitly asks for a full
++//! project import; the in-process markdown path stays Python-free.
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++use serde::Serialize;
++
++use super::paths::nv_home;
++use super::read_ops::registry_source_folders;
++use super::types::{MemoryError, Result};
++
++#[derive(Debug, Clone, Default, Serialize)]
++pub struct FullImportReport {
++    /// How many enabled source folders were imported.
++    pub folders_imported: u32,
++    /// Total files copied into the vault by the importer (across folders).
++    pub files_copied: u32,
++    /// Sidecars/markdown newly ingested (or re-ingested after a change).
++    pub ingested: u32,
++    /// Files whose content was unchanged (ingest short-circuited).
++    pub unchanged: u32,
++}
++
++/// First python interpreter on PATH that actually runs.
++fn find_python() -> Option<String> {
++    for cand in ["python", "python3", "py"] {
++        let ok = Command::new(cand)
++            .arg("--version")
++            .output()
++            .map(|o| o.status.success())
++            .unwrap_or(false);
++        if ok {
++            return Some(cand.to_string());
++        }
++    }
++    None
++}
++
++/// Locate `scripts/import_project_vault.py`. Honors
++/// `NEUROVAULT_IMPORTER_SCRIPT`, else searches the working directory (dev)
++/// and a few levels up from the executable.
++fn importer_script() -> Option<PathBuf> {
++    if let Ok(p) = std::env::var("NEUROVAULT_IMPORTER_SCRIPT") {
++        let pb = PathBuf::from(p);
++        if pb.is_file() {
++            return Some(pb);
++        }
++    }
++    let rel = Path::new("scripts").join("import_project_vault.py");
++    let mut roots: Vec<PathBuf> = Vec::new();
++    if let Ok(cwd) = std::env::current_dir() {
++        roots.push(cwd);
++    }
++    if let Ok(exe) = std::env::current_exe() {
++        let mut p: &Path = exe.as_path();
++        for _ in 0..6 {
++            if let Some(parent) = p.parent() {
++                roots.push(parent.to_path_buf());
++                p = parent;
++            } else {
++                break;
++            }
++        }
++    }
++    roots
++        .into_iter()
++        .map(|r| r.join(&rel))
++        .find(|c| c.is_file())
++}
++
++/// Look up a brain's current display name in `brains.json` so we can pass it
++/// through to the importer and NOT clobber it (the importer's ensure_registry
++/// would otherwise reset the name to the source folder's basename).
++fn brain_name(brain_id: &str) -> Option<String> {
++    let registry = nv_home().join("brains.json");
++    let data = std::fs::read_to_string(registry).ok()?;
++    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
++    json.get("brains")?
++        .as_array()?
++        .iter()
++        .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(brain_id))
++        .and_then(|b| b.get("name").and_then(|v| v.as_str()))
++        .map(|s| s.to_string())
++}
++
++/// Run the importer for one source folder into `brain_id`. Returns
++/// `files_copied` parsed from the importer's JSON summary (best-effort).
++fn run_importer(
++    python: &str,
++    script: &Path,
++    source: &str,
++    home: &Path,
++    brain_id: &str,
++    name: Option<&str>,
++) -> Result<u32> {
++    let mut cmd = Command::new(python);
++    cmd.arg(script)
++        .arg("--source")
++        .arg(source)
++        .arg("--nv-home")
++        .arg(home)
++        .arg("--brain-id")
++        .arg(brain_id);
++    if let Some(n) = name {
++        cmd.arg("--name").arg(n);
++    }
++    let output = cmd
++        .output()
++        .map_err(|e| MemoryError::Other(format!("could not run python importer: {e}")))?;
++    if !output.status.success() {
++        let err = String::from_utf8_lossy(&output.stderr);
++        return Err(MemoryError::Other(format!(
++            "project importer failed for {source}: {}",
++            err.trim()
++        )));
++    }
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let copied = serde_json::from_str::<serde_json::Value>(&stdout)
++        .ok()
++        .and_then(|v| v.get("files_copied").and_then(|n| n.as_u64()))
++        .unwrap_or(0) as u32;
++    Ok(copied)
++}
++
++/// Walk the vault for ingestable `*.md`, skipping dotfolders + `trash` — the
++/// SAME rule `/api/update` uses, so a full import and a reindex agree on what
++/// is searchable (config dotfiles stay on disk but out of the index).
++fn collect_vault_md(root: &Path, out: &mut Vec<PathBuf>) {
++    let Ok(entries) = std::fs::read_dir(root) else {
++        return;
++    };
++    for entry in entries.flatten() {
++        let path = entry.path();
++        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
++            continue;
++        };
++        if name.starts_with('.') {
++            continue;
++        }
++        if path.is_dir() {
++            if name == "trash" {
++                continue;
++            }
++            collect_vault_md(&path, out);
++        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
++            out.push(path);
++        }
++    }
++}
++
++/// Full project import for `brain_id`: run the `/update-brain` importer for
++/// every enabled source folder, then ingest the vault so the new sidecars
++/// become searchable. Requires Python + the importer script on disk.
++pub fn full_import(brain_id: &str) -> Result<FullImportReport> {
++    let folders = registry_source_folders(brain_id)?;
++    let enabled: Vec<&super::types::SourceFolder> =
++        folders.iter().filter(|f| f.enabled).collect();
++    if enabled.is_empty() {
++        return Ok(FullImportReport::default());
++    }
++
++    let python = find_python().ok_or_else(|| {
++        MemoryError::Other(
++            "Python was not found on PATH — it's required for a full project import (the same dependency the /update-brain skill uses).".into(),
++        )
++    })?;
++    let script = importer_script().ok_or_else(|| {
++        MemoryError::Other("scripts/import_project_vault.py could not be located.".into())
++    })?;
++    let home = nv_home();
++    let name = brain_name(brain_id);
++
++    let mut report = FullImportReport::default();
++    for f in &enabled {
++        report.files_copied +=
++            run_importer(&python, &script, &f.path, &home, brain_id, name.as_deref())?;
++        report.folders_imported += 1;
++    }
++
++    // Ingest the vault so the new sidecars are searchable. content_hash
++    // short-circuits unchanged files, so this only embeds what's new.
++    let vault = super::read_ops::resolve_vault_path(brain_id)?;
++    let db = super::db::open_brain(brain_id)?;
++    let mut files: Vec<PathBuf> = Vec::new();
++    collect_vault_md(&vault, &mut files);
++    for path in &files {
++        match super::ingest::ingest_file(path, Some(&vault), &db) {
++            Ok(Some(_)) => report.ingested += 1,
++            Ok(None) => report.unchanged += 1,
++            Err(e) => eprintln!("[full_import] ingest failed for {}: {}", path.display(), e),
++        }
++    }
++
++    Ok(report)
++}
+diff --git a/src/App.tsx b/src/App.tsx
+index f7da26d..aee6d9a 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -21,6 +21,7 @@ import { useBrainStore } from "./stores/brainStore";
+ import { useGraphStore } from "./stores/graphStore";
+ import { toast } from "./stores/toastStore";
+ import { useConsumerHealthStore } from "./stores/consumerHealthStore";
++import { fetchStatus } from "./lib/api";
+ import { healthToneColor } from "./lib/consumerHealth";
+ import { meetingsDropClaim } from "./lib/meetingsDropClaim";
+ import { canLeaveView } from "./lib/navigationGuard";
+@@ -187,6 +188,41 @@ export default function App() {
+   const serverUp = healthSignals.service === "online";
+   const serverDown = healthSignals.service === "offline";
+ 
++  // --- Eject SSD Brain (local add-on) ---------------------------------
++  //
++  // These brains live on an external SSD, so the app needs a "flush and
++  // release the drive" affordance. `ejectBusy` fingerprints the index
++  // (memories + chunks + connections + entities): while anything is being
++  // ingested those counters move, and ejecting mid-ingest risks losing the
++  // items still in flight. Two consecutive identical samples = idle.
++  const [ejectBusy, setEjectBusy] = useState(false);
++  const activityRef = useRef<{ fp: number; stable: number }>({ fp: -1, stable: 0 });
++
++  useEffect(() => {
++    if (!serverUp) return;
++    let cancelled = false;
++    const sample = () => {
++      fetchStatus()
++        .then((s) => {
++          if (cancelled) return;
++          const fp = s.memories + s.chunks + s.connections + s.entities;
++          const a = activityRef.current;
++          if (fp !== a.fp) {
++            a.fp = fp;
++            a.stable = 0;
++            setEjectBusy(true);
++          } else {
++            a.stable += 1;
++            if (a.stable >= 1) setEjectBusy(false);
++          }
++        })
++        .catch(() => { /* no active brain yet — leave the last state */ });
++    };
++    sample();
++    const id = window.setInterval(sample, 5000);
++    return () => { cancelled = true; window.clearInterval(id); };
++  }, [serverUp]);
++
+   useEffect(() => {
+     void initializeConsumerVault(loadBrains, initVault);
+   }, [initVault, loadBrains]);
+@@ -883,6 +919,54 @@ export default function App() {
+               {health.headline}
+             </span>
+           </button>
++          {/* Eject SSD Brain (local add-on) — flush the brain so brain.db is
++              complete, hand the drive to the elevated eject task, then quit so
++              every file handle is released. */}
++          <button
++            type="button"
++            onClick={async () => {
++              try {
++                const { ask } = await import("@tauri-apps/plugin-dialog");
++                const busyWarn = ejectBusy
++                  ? "⚠ The brain is still indexing — items being added right now may not make it in (your source files stay safe). Wait for the dot to turn green for a clean eject.\n\n"
++                  : "";
++                const ok = await ask(
++                  `${busyWarn}This flushes the brain so brain.db is fully written, then safely ejects the SSD and closes NeuroVault.\n\nThe brain stays unavailable until you replug the drive and reopen the app.`,
++                  { title: "Eject SSD Brain", kind: "warning", okLabel: "Eject & Close", cancelLabel: "Cancel" },
++                );
++                if (!ok) return;
++                toast.info("Flushing the brain…");
++                const { invoke } = await import("@tauri-apps/api/core");
++                const msg = await invoke<string>("nv_eject_ssd_brain");
++                toast.success(`${msg} Closing now — unplug once the drive disappears from Explorer.`);
++                // `quit_after_save`, not `exit(0)`: ExitRequested refuses to
++                // exit until ALLOW_EXIT_AFTER_SAVE is set, so a raw exit would
++                // be swallowed and the app would stay open holding the drive.
++                window.setTimeout(() => { void invoke("quit_after_save"); }, 1800);
++              } catch (e) {
++                toast.error(`Eject failed: ${e}. Your data is flushed & safe — use Windows "Safely Remove Hardware".`);
++              }
++            }}
++            title={ejectBusy
++              ? "Indexing in progress — wait for the dot to turn green before ejecting"
++              : "Safe to eject — flush and safely remove the SSD (closes the app)"}
++            className="flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-md transition-colors"
++            style={{ color: theme.textMuted, background: "transparent", border: `1px solid ${theme.border}` }}
++            onMouseEnter={(e) => { e.currentTarget.style.background = `${theme.negative}1a`; e.currentTarget.style.color = theme.negative; e.currentTarget.style.borderColor = `${theme.negative}55`; }}
++            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = theme.textMuted; e.currentTarget.style.borderColor = theme.border; }}
++          >
++            <span
++              className={`w-1.5 h-1.5 rounded-full flex-shrink-0${ejectBusy ? " animate-pulse" : ""}`}
++              style={ejectBusy
++                ? { backgroundColor: theme.accent }
++                : { backgroundColor: theme.positive, boxShadow: `0 0 6px ${theme.positive}66` }}
++            />
++            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
++              <path d="M12 4 5 13h14L12 4Z" />
++              <path d="M6 17h12" />
++            </svg>
++            {ejectBusy ? "Indexing…" : "Eject SSD Brain"}
++          </button>
+           <div className="flex items-center gap-0.5" aria-label="Window controls">
+             <button
+               type="button"
+-- 
+2.53.0.windows.2
+

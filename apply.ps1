@@ -16,13 +16,8 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "Applying local tweaks..." -ForegroundColor Cyan
-git apply --3way "$here\local-tweaks\local-tweaks.diff"
+# No local-tweaks step any more: as of the v0.6.0 rebase every add-on is a
+# real commit, so the patches above carry the launcher, the skills and the
+# python helpers too.
 
-$dst = "scripts"
-if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst | Out-Null }
-# Copy every helper in local-tweaks\scripts\, so dropping a new one in
-# there is enough to ship it — this script never needs editing again.
-Copy-Item "$here\local-tweaks\scripts\*.py" $dst -Force
-
-Write-Host "`nDone. Build with:  npm install ; npm run tauri dev" -ForegroundColor Green
+Write-Host "`nDone. Build with:  npm install ; npm run tauri build" -ForegroundColor Green
