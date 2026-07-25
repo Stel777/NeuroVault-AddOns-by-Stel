@@ -1,0 +1,139 @@
+From 2831213e5c3198681b1d680043a05d39a989140d Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sun, 26 Jul 2026 00:50:52 +0300
+Subject: [PATCH 7/7] fix(vaults): portal the vault panel so the sidebar stops
+ clipping it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The panel was an absolutely-positioned child of the picker, which sits inside
+the 208px sidebar. It rendered its full 260px width, but everything past the
+sidebar's edge was cut: the sort label was sliced mid-word and the list/grid
+toggle — drawn furthest right — was invisible and unclickable. Truncating the
+sort label did not help, because nothing was overflowing the PANEL; the panel
+itself was being clipped.
+
+Portal it to <body> and position it fixed against the trigger's rect instead.
+No ancestor can clip it now, which also lets grid use a width far larger than
+the sidebar. Coordinates are clamped to the viewport so a wide grid cannot
+spill off either edge, and re-synced on resize and scroll.
+
+The outside-click handler now tests the panel separately: portaled out of the
+component's subtree, every click inside it would otherwise read as "outside"
+and close the panel before the click landed.
+
+Not covered by a test: jsdom has no layout, so clipping cannot be asserted.
+The behavioural tests (open, pick a vault, switch) do cover the portal path.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/components/BrainSelector.tsx | 62 +++++++++++++++++++++++++++-----
+ 1 file changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/src/components/BrainSelector.tsx b/src/components/BrainSelector.tsx
+index 80c8bbb..0e6a389 100644
+--- a/src/components/BrainSelector.tsx
++++ b/src/components/BrainSelector.tsx
+@@ -1,4 +1,5 @@
+-import { useState, useRef, useEffect, useMemo } from "react";
++import { useState, useRef, useEffect, useMemo, useCallback } from "react";
++import { createPortal } from "react-dom";
+ import { useBrainStore } from "../stores/brainStore";
+ import { BrainSourcesPanel } from "./BrainSourcesPanel";
+ import { API_HOST } from "../lib/config";
+@@ -79,6 +80,43 @@ export function BrainSelector({
+   const [editName, setEditName] = useState("");
+   const [editDesc, setEditDesc] = useState("");
+   const dropdownRef = useRef<HTMLDivElement>(null);
++  // The panel is PORTALED to <body> and positioned fixed against the trigger.
++  //
++  // It used to be an absolutely-positioned child, which meant it was clipped by
++  // the sidebar it lives in: the panel rendered its full width, but everything
++  // past the sidebar's edge was cut — taking the view toggle with it, and
++  // slicing the sort label mid-word. Widths here (260px, and far more in grid)
++  // are deliberately larger than the 208px sidebar, so escaping the subtree is
++  // the only reliable fix. Fixed coords also keep grid from running off-screen.
++  const panelRef = useRef<HTMLDivElement>(null);
++  const [anchor, setAnchor] = useState<{ left: number; top: number; bottom: number } | null>(null);
++
++  const panelWidth = isGrid
++    ? Math.min(typeof window === "undefined" ? 760 : window.innerWidth * 0.76, 760)
++    : 260;
++
++  const syncAnchor = useCallback(() => {
++    const el = dropdownRef.current;
++    if (!el) return;
++    const r = el.getBoundingClientRect();
++    setAnchor({
++      // Clamp so a wide grid panel cannot spill past either viewport edge.
++      left: Math.max(8, Math.min(r.left, window.innerWidth - panelWidth - 8)),
++      top: r.bottom + 4,
++      bottom: window.innerHeight - r.top + 4,
++    });
++  }, [panelWidth]);
++
++  useEffect(() => {
++    if (!open) return;
++    syncAnchor();
++    window.addEventListener("resize", syncAnchor);
++    window.addEventListener("scroll", syncAnchor, true);
++    return () => {
++      window.removeEventListener("resize", syncAnchor);
++      window.removeEventListener("scroll", syncAnchor, true);
++    };
++  }, [open, syncAnchor]);
+   // When set, the per-brain Source Folders panel is open for this brain id.
+   // The panel portals to document.body, so it survives the dropdown closing.
+   const [sourcesPanelBrainId, setSourcesPanelBrainId] = useState<string | null>(null);
+@@ -145,7 +183,13 @@ export function BrainSelector({
+   useEffect(() => {
+     if (!open) return;
+     const handler = (e: MouseEvent) => {
+-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
++      const target = e.target as Node;
++      // The panel is portaled out of this subtree, so it has to be tested
++      // separately — otherwise every click INSIDE the panel reads as "outside"
++      // and closes it before the click can land.
++      const inTrigger = dropdownRef.current?.contains(target) ?? false;
++      const inPanel = panelRef.current?.contains(target) ?? false;
++      if (!inTrigger && !inPanel) {
+         setOpen(false);
+         setCreating(false);
+         setSortMenuOpen(false);
+@@ -267,16 +311,17 @@ export function BrainSelector({
+       </button>
+ 
+       {/* The global rail and Settings use different vertical anchors. */}
+-      {open && (
++      {open && anchor && createPortal(
+         <div
+-          className={`absolute left-0 rounded-lg shadow-2xl z-50 overflow-hidden ${isGrid ? "" : "w-[260px]"} ${placement === "down" ? "top-full mt-1" : "bottom-full mb-1"}`}
++          ref={panelRef}
++          className="fixed rounded-lg shadow-2xl z-[100] overflow-hidden"
+           style={{
+             background: "var(--nv-bg)",
+             border: "1px solid var(--nv-border)",
+             boxShadow: "0 -8px 32px rgba(0,0,0,0.3)",
+-            // Grid needs room for several columns, but must not run off a
+-            // narrow window — hence min() against the viewport.
+-            ...(isGrid ? { width: "min(76vw, 760px)" } : {}),
++            left: anchor.left,
++            width: panelWidth,
++            ...(placement === "down" ? { top: anchor.top } : { bottom: anchor.bottom }),
+           }}
+         >
+           {/* Header — vault count + sort control + view toggle.
+@@ -724,7 +769,8 @@ export function BrainSelector({
+               </button>
+             </div>
+           )}
+-        </div>
++        </div>,
++        document.body,
+       )}
+ 
+       {/* Per-brain source folders panel — portals to document.body, so it
+-- 
+2.53.0.windows.2
+

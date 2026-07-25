@@ -1,7 +1,7 @@
 From ad5fb3a85510b492bad448aecc132fae39599daf Mon Sep 17 00:00:00 2001
 From: Stel777 <274792865+Stel777@users.noreply.github.com>
 Date: Sun, 26 Jul 2026 00:30:18 +0300
-Subject: [PATCH 6/6] fix(vaults): stop the grid toggle being clipped out of
+Subject: [PATCH 6/7] fix(vaults): stop the grid toggle being clipped out of
  the panel header
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 1c5e8367a5b5df140531ac8f5ffdfcb947dd812e Mon Sep 17 00:00:00 2001
 From: Stel777 <274792865+Stel777@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 15:47:08 +0300
-Subject: [PATCH 2/6] feat(source-folders): port the "Full import (code)"
+Subject: [PATCH 2/7] feat(source-folders): port the "Full import (code)"
  button onto v0.6.0
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 12a5487776889ae826febe2b16d0a2f25d0a9cb9 Mon Sep 17 00:00:00 2001
 From: Stel777 <274792865+Stel777@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 15:13:13 +0300
-Subject: [PATCH 1/6] feat(ssd): port the SSD brain workflow onto v0.6.0
+Subject: [PATCH 1/7] feat(ssd): port the SSD brain workflow onto v0.6.0
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

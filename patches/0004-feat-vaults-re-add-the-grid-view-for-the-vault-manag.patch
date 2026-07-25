@@ -1,7 +1,7 @@
 From 1787e9cb880d1442aed60f3f1f505e29a088c8dd Mon Sep 17 00:00:00 2001
 From: Stel777 <274792865+Stel777@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 20:02:44 +0300
-Subject: [PATCH 4/6] feat(vaults): re-add the grid view for the vault manager
+Subject: [PATCH 4/7] feat(vaults): re-add the grid view for the vault manager
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
