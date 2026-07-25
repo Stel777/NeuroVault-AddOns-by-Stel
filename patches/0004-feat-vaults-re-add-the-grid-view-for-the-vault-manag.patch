@@ -1,0 +1,157 @@
+From 1787e9cb880d1442aed60f3f1f505e29a088c8dd Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 20:02:44 +0300
+Subject: [PATCH 4/5] feat(vaults): re-add the grid view for the vault manager
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream v0.6.0 took the sortable vault list but not the grid, and a 260px
+single column is a long scroll once there are dozens of vaults.
+
+Grid widens the panel to min(76vw, 760px) and tiles the vaults with
+auto-fill/minmax columns, so the count of columns follows the window instead
+of being fixed. Each row gains a border + radius in grid mode only (in list
+mode the panel already separates them, so a border would just add noise), and
+the active vault is outlined in the accent colour. The choice persists in
+localStorage next to the sort key, and both views share the same sort.
+
+Re-anchored rather than copied: the 0.5.2 version expanded to fill the space
+beside the sidebar via a [data-neurovault-sidebar] lookup, which does not
+exist on this path — the selector now lives in Settings -> Open vault manager.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/components/BrainSelector.tsx | 82 ++++++++++++++++++++++++++++++--
+ 1 file changed, 78 insertions(+), 4 deletions(-)
+
+diff --git a/src/components/BrainSelector.tsx b/src/components/BrainSelector.tsx
+index d454bc8..29c2dac 100644
+--- a/src/components/BrainSelector.tsx
++++ b/src/components/BrainSelector.tsx
+@@ -45,6 +45,16 @@ export function BrainSelector({
+     }
+   });
+   const [sortMenuOpen, setSortMenuOpen] = useState(false);
++  // List vs grid. With dozens of vaults a 260px single column is a long scroll,
++  // so grid widens the panel and tiles them. Persisted like the sort key.
++  const [viewMode, setViewMode] = useState<"list" | "grid">(() => {
++    try {
++      return localStorage.getItem("neurovault.brainSelector.view") === "grid" ? "grid" : "list";
++    } catch {
++      return "list";
++    }
++  });
++  const isGrid = viewMode === "grid";
+   const [creating, setCreating] = useState(false);
+   const [newName, setNewName] = useState("");
+   const [newDesc, setNewDesc] = useState("");
+@@ -64,6 +74,10 @@ export function BrainSelector({
+     try { localStorage.setItem("neurovault.brainSelector.sort", sortKey); } catch { /* ignore */ }
+   }, [sortKey]);
+ 
++  useEffect(() => {
++    try { localStorage.setItem("neurovault.brainSelector.view", viewMode); } catch { /* ignore */ }
++  }, [viewMode]);
++
+   // Sorted view of the brains. `name`/`created` use fields present
+   // immediately; `modified`/`notes` read per-brain stats (fetched on open)
+   // and re-sort once those arrive. Pure sort by the chosen key — the active
+@@ -224,11 +238,14 @@ export function BrainSelector({
+       {/* The global rail and Settings use different vertical anchors. */}
+       {open && (
+         <div
+-          className={`absolute left-0 w-[260px] rounded-lg shadow-2xl z-50 overflow-hidden ${placement === "down" ? "top-full mt-1" : "bottom-full mb-1"}`}
++          className={`absolute left-0 rounded-lg shadow-2xl z-50 overflow-hidden ${isGrid ? "" : "w-[260px]"} ${placement === "down" ? "top-full mt-1" : "bottom-full mb-1"}`}
+           style={{
+             background: "var(--nv-bg)",
+             border: "1px solid var(--nv-border)",
+             boxShadow: "0 -8px 32px rgba(0,0,0,0.3)",
++            // Grid needs room for several columns, but must not run off a
++            // narrow window — hence min() against the viewport.
++            ...(isGrid ? { width: "min(76vw, 760px)" } : {}),
+           }}
+         >
+           {/* Header — vault count + sort control */}
+@@ -291,10 +308,56 @@ export function BrainSelector({
+                 </div>
+               )}
+             </div>
++            {/* List / grid toggle — grid is the browsable view when there are
++                dozens of vaults. Applies to whatever sort is selected. */}
++            <div className="flex items-center gap-0.5 rounded-md p-0.5" style={{ background: "var(--nv-surface)" }}>
++              <button
++                onClick={() => setViewMode("list")}
++                className="w-6 h-6 rounded flex items-center justify-center transition-colors"
++                style={{
++                  color: viewMode === "list" ? "var(--nv-text)" : "var(--nv-text-dim)",
++                  background: viewMode === "list" ? "var(--nv-bg)" : "transparent",
++                }}
++                title="List view"
++                aria-label="List view"
++                aria-pressed={viewMode === "list"}
++              >
++                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
++                </svg>
++              </button>
++              <button
++                onClick={() => setViewMode("grid")}
++                className="w-6 h-6 rounded flex items-center justify-center transition-colors"
++                style={{
++                  color: viewMode === "grid" ? "var(--nv-text)" : "var(--nv-text-dim)",
++                  background: viewMode === "grid" ? "var(--nv-bg)" : "transparent",
++                }}
++                title="Grid view"
++                aria-label="Grid view"
++                aria-pressed={viewMode === "grid"}
++              >
++                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />
++                </svg>
++              </button>
++            </div>
+           </div>
+ 
+-          {/* Vault list */}
+-          <div className="max-h-[280px] overflow-y-auto py-1">
++          {/* Vault list / grid */}
++          <div
++            className={isGrid ? "overflow-y-auto p-1.5" : "max-h-[280px] overflow-y-auto py-1"}
++            style={
++              isGrid
++                ? {
++                    display: "grid",
++                    gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
++                    gap: "6px",
++                    maxHeight: "min(60vh, 460px)",
++                  }
++                : undefined
++            }
++          >
+             {sortedBrains.map((brain) => {
+               const isEditing = editingId === brain.id;
+               const isConfirming = confirmDelete === brain.id;
+@@ -448,7 +511,18 @@ export function BrainSelector({
+                 <div
+                   key={brain.id}
+                   className="group relative flex items-start gap-2.5 px-3 py-2 transition-colors"
+-                  style={{ background: brain.is_active ? "var(--nv-surface)" : undefined }}
++                  style={{
++                    background: brain.is_active ? "var(--nv-surface)" : undefined,
++                    // In grid mode each row becomes a tile, so it needs its own
++                    // edge — in list mode the rows are separated by the panel
++                    // itself and a border would just add noise.
++                    ...(isGrid
++                      ? {
++                          border: `1px solid ${brain.is_active ? "var(--nv-accent)" : "var(--nv-border)"}`,
++                          borderRadius: "8px",
++                        }
++                      : {}),
++                  }}
+                 >
+                   {mode === "switch" ? (
+                     <button
+-- 
+2.53.0.windows.2
+

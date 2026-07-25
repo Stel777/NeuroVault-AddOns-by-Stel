@@ -1,0 +1,49 @@
+From 9ff63deb469932ed1f0a5e4ec4591646ade37aa0 Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 19:57:59 +0300
+Subject: [PATCH 3/5] fix(nav): make the Active vault dropdown readable in
+ every appearance
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The option list of a native <select> is drawn by the OS, which picks its
+palette from `color-scheme`. The theme sets that on :root from the app
+appearance, but the sidebar is dark in ALL eight themes — every navBg is a
+dark gradient and every navText is near-white. So under a light appearance
+the OS painted a white list while the options inherited near-white nav text:
+white on white, and switching appearance could never fix it because the nav
+palette does not follow the appearance.
+
+Pin `color-scheme: dark` on that select so the list matches the sidebar it
+drops out of. The other selects are on themed surfaces, where text colour and
+:root's color-scheme move together, so they are left alone.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/components/ConsumerNavigation.tsx | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/components/ConsumerNavigation.tsx b/src/components/ConsumerNavigation.tsx
+index bee83e0..0c0b43a 100644
+--- a/src/components/ConsumerNavigation.tsx
++++ b/src/components/ConsumerNavigation.tsx
+@@ -213,6 +213,15 @@ export function ConsumerNavigation({
+                 color: "var(--nv-nav-text)",
+                 background: "var(--nv-nav-surface)",
+                 border: "1px solid var(--nv-nav-border)",
++                // The OPTION LIST is drawn by the OS, not by us, and it takes
++                // its palette from `color-scheme` — which the theme sets on
++                // :root from the app appearance. The sidebar, though, is dark
++                // in every theme (every navBg is a dark gradient, every navText
++                // near-white), so under a light appearance the OS painted a
++                // white list while the options inherited near-white nav text:
++                // unreadable, and no appearance setting could fix it. Pin the
++                // list to dark so it matches the sidebar it drops out of.
++                colorScheme: "dark",
+               }}
+               value={activeBrainId ?? ""}
+               disabled={vaultSwitchBusy}
+-- 
+2.53.0.windows.2
+

@@ -1,0 +1,261 @@
+From 99c3b80ade66734764f44b3db67ecffb5d13c5d4 Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 20:14:01 +0300
+Subject: [PATCH 5/5] feat(nav): put the real vault picker in the sidebar, with
+ list/grid
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The sidebar switched vaults through a native <select>. Its option list is
+drawn by the OS from `color-scheme`, which the theme sets on :root from the
+app appearance — but the sidebar is dark in every theme, so under a light
+appearance the OS painted a white list while the options inherited near-white
+nav text. White on white, unfixable by changing appearance. It also gave no
+way to browse 30+ vaults: no sort, no grid, one long native list.
+
+Replace it with BrainSelector, which draws its own list and brings the sort
+control and the list/grid toggle with it. Three small additions make it fit:
+
+- `tone="nav"` so the TRIGGER uses the --nv-nav-* palette (app-theme text is
+  unreadable on the always-dark sidebar). The dropdown keeps the app palette;
+  it is a floating panel and is self-consistent either way.
+- `onSwitch` so the host keeps its own transition. This matters: the sidebar
+  navigates off vault-scoped views BEFORE activating, handles a note that
+  refuses to save, and calls onVaultActivated. Switching directly would have
+  dropped all of that — the guard upstream added deliberately.
+- `disabled` so the trigger locks while a switch is in flight, preserving the
+  behaviour the native control had.
+
+ConsumerNavigation's tests drove the <select> directly; they now drive the
+picker through two helpers, keeping every behavioural assertion (moves to
+Memories, locks while switching, respects a blocked note, reports failure)
+unchanged. Full frontend suite green: 130 tests.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/components/BrainSelector.tsx           | 39 +++++++++++++++++--
+ src/components/ConsumerNavigation.test.tsx | 26 +++++++++----
+ src/components/ConsumerNavigation.tsx      | 45 +++++++++-------------
+ 3 files changed, 71 insertions(+), 39 deletions(-)
+
+diff --git a/src/components/BrainSelector.tsx b/src/components/BrainSelector.tsx
+index 29c2dac..b899172 100644
+--- a/src/components/BrainSelector.tsx
++++ b/src/components/BrainSelector.tsx
+@@ -28,10 +28,25 @@ export function BrainSelector({
+   triggerLabel,
+   placement = "up",
+   mode = "switch",
++  tone = "app",
++  onSwitch,
++  disabled = false,
+ }: {
+   triggerLabel?: string;
+   placement?: "up" | "down";
+   mode?: "switch" | "manage";
++  /** Which palette the TRIGGER draws from. The sidebar is dark in every theme
++   *  and has its own `--nv-nav-*` vars, so app-theme text would be unreadable
++   *  there under a light appearance. The dropdown itself always uses the app
++   *  palette — it is a floating panel, and it is self-consistent either way. */
++  tone?: "app" | "nav";
++  /** Override the switch. Hosts that must guard the transition (leave scoped
++   *  views, flush the open note) pass their own flow; omitted, the selector
++   *  activates the brain directly. */
++  onSwitch?: (brainId: string) => void | Promise<void>;
++  /** Lock the trigger while the host is mid-transition, so a second vault
++   *  cannot be selected before the first activation finishes. */
++  disabled?: boolean;
+ } = {}) {
+   const { brains, activeBrainName, loading, switchBrain, createBrain, updateBrain, deleteBrain, loadBrains } =
+     useBrainStore();
+@@ -143,6 +158,14 @@ export function BrainSelector({
+   const handleSwitch = async (brainId: string) => {
+     setOpen(false);
+     setSortMenuOpen(false);
++    // The sidebar has to do more than flip the active brain: it navigates off
++    // vault-scoped views first so they cannot keep operating against the old
++    // vault mid-switch, and it handles a note that failed to save. When a host
++    // supplies that flow, defer to it rather than switching behind its back.
++    if (onSwitch) {
++      await onSwitch(brainId);
++      return;
++    }
+     await switchBrain(brainId);
+   };
+ 
+@@ -217,9 +240,17 @@ export function BrainSelector({
+       {/* Trigger — shows current brain name */}
+       <button
+         onClick={() => setOpen((o) => !o)}
+-        className="flex items-center gap-1.5 px-2 py-1.5 text-[12px] font-[Geist,sans-serif] rounded-md transition-all w-full text-left"
+-        style={{ color: "var(--nv-text-muted)" }}
+-        disabled={loading}
++        className={`flex items-center gap-1.5 text-[12px] font-[Geist,sans-serif] transition-all w-full text-left ${tone === "nav" ? "px-2.5 py-2 rounded-lg" : "px-2 py-1.5 rounded-md"}`}
++        style={
++          tone === "nav"
++            ? {
++                color: "var(--nv-nav-text)",
++                background: "var(--nv-nav-surface)",
++                border: "1px solid var(--nv-nav-border)",
++              }
++            : { color: "var(--nv-text-muted)" }
++        }
++        disabled={loading || disabled}
+         aria-label={triggerLabel ?? "Switch active vault"}
+       >
+         <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: "var(--nv-accent)" }} />
+@@ -228,7 +259,7 @@ export function BrainSelector({
+         </span>
+         <svg
+           className={`w-3 h-3 flex-shrink-0 transition-transform ${open ? "rotate-180" : ""}`}
+-          style={{ color: "var(--nv-text-dim)" }}
++          style={{ color: tone === "nav" ? "var(--nv-nav-dim)" : "var(--nv-text-dim)" }}
+           fill="none" viewBox="0 0 24 24" stroke="currentColor"
+         >
+           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+diff --git a/src/components/ConsumerNavigation.test.tsx b/src/components/ConsumerNavigation.test.tsx
+index a027537..319ab7a 100644
+--- a/src/components/ConsumerNavigation.test.tsx
++++ b/src/components/ConsumerNavigation.test.tsx
+@@ -12,6 +12,16 @@ const NAVIGATION_LABELS = [
+   "Review",
+ ] as const;
+ 
++// The sidebar vault control is the vault picker, not a native <select>: a
++// trigger button that opens a list/grid of vaults. These wrap that two-step
++// interaction so the tests keep asserting behaviour rather than markup.
++const vaultTrigger = () => screen.getByRole("button", { name: "Switch active vault" });
++
++const selectVault = async (user: ReturnType<typeof userEvent.setup>, name: string) => {
++  await user.click(vaultTrigger());
++  await user.click(await screen.findByRole("button", { name: new RegExp(name, "i") }));
++};
++
+ describe("ConsumerNavigation", () => {
+   beforeEach(() => {
+     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+@@ -206,7 +216,7 @@ describe("ConsumerNavigation", () => {
+       />,
+     );
+ 
+-    expect(screen.queryByRole("combobox", { name: "Active vault" })).not.toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Switch active vault" })).not.toBeInTheDocument();
+   });
+ 
+   it("marks the footer Settings destination active without adding it to the primary menu", () => {
+@@ -267,14 +277,14 @@ describe("ConsumerNavigation", () => {
+       />,
+     );
+ 
+-    await user.selectOptions(screen.getByRole("combobox", { name: "Active vault" }), "second");
++    await selectVault(user, "Second vault");
+     expect(switchBrain).toHaveBeenCalledWith("second");
+     expect(onNavigate).toHaveBeenCalledWith("memories");
+-    expect(screen.getByRole("combobox", { name: "Active vault" })).toBeDisabled();
++    expect(vaultTrigger()).toBeDisabled();
+     expect(screen.getByRole("status")).toHaveTextContent("Switching to Second vault");
+ 
+     finishSwitch?.();
+-    await waitFor(() => expect(screen.getByRole("combobox", { name: "Active vault" })).toBeEnabled());
++    await waitFor(() => expect(vaultTrigger()).toBeEnabled());
+     expect(onNavigate).toHaveBeenCalledTimes(2);
+   });
+ 
+@@ -309,7 +319,7 @@ describe("ConsumerNavigation", () => {
+     }
+ 
+     render(<Harness />);
+-    await user.selectOptions(screen.getByRole("combobox", { name: "Active vault" }), "second");
++    await selectVault(user, "Second vault");
+ 
+     await waitFor(() => expect(screen.getByRole("button", { name: "Memories" })).toHaveAttribute("aria-current", "page"));
+     expect(switchBrain).toHaveBeenCalledWith("second");
+@@ -337,7 +347,7 @@ describe("ConsumerNavigation", () => {
+       />,
+     );
+ 
+-    await user.selectOptions(screen.getByRole("combobox", { name: "Active vault" }), "second");
++    await selectVault(user, "Second vault");
+     expect(switchBrain).not.toHaveBeenCalled();
+   });
+ 
+@@ -363,10 +373,10 @@ describe("ConsumerNavigation", () => {
+       />,
+     );
+ 
+-    await user.selectOptions(screen.getByRole("combobox", { name: "Active vault" }), "second");
++    await selectVault(user, "Second vault");
+ 
+     expect(onNavigate).toHaveBeenCalledWith("memories");
+     expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't switch vault");
+-    expect(screen.getByRole("combobox", { name: "Active vault" })).toBeEnabled();
++    expect(vaultTrigger()).toBeEnabled();
+   });
+ });
+diff --git a/src/components/ConsumerNavigation.tsx b/src/components/ConsumerNavigation.tsx
+index 0c0b43a..c603c4c 100644
+--- a/src/components/ConsumerNavigation.tsx
++++ b/src/components/ConsumerNavigation.tsx
+@@ -1,6 +1,7 @@
+ import { useEffect, useMemo, useState } from "react";
+ import { API_HOST } from "../lib/config";
+ import { useBrainStore } from "../stores/brainStore";
++import { BrainSelector } from "./BrainSelector";
+ import vaultMark from "../assets/vault-mark-transparent.png";
+ 
+ export type ConsumerDestination =
+@@ -205,33 +206,23 @@ export function ConsumerNavigation({
+             <p className="text-[10px] font-semibold uppercase tracking-[0.14em]" style={{ color: "var(--nv-nav-dim)" }}>
+               Active vault
+             </p>
+-            <select
+-              aria-label="Active vault"
+-              aria-busy={vaultSwitchBusy}
+-              className="mt-1.5 w-full rounded-lg px-2.5 py-2 text-[12px] outline-none"
+-              style={{
+-                color: "var(--nv-nav-text)",
+-                background: "var(--nv-nav-surface)",
+-                border: "1px solid var(--nv-nav-border)",
+-                // The OPTION LIST is drawn by the OS, not by us, and it takes
+-                // its palette from `color-scheme` — which the theme sets on
+-                // :root from the app appearance. The sidebar, though, is dark
+-                // in every theme (every navBg is a dark gradient, every navText
+-                // near-white), so under a light appearance the OS painted a
+-                // white list while the options inherited near-white nav text:
+-                // unreadable, and no appearance setting could fix it. Pin the
+-                // list to dark so it matches the sidebar it drops out of.
+-                colorScheme: "dark",
+-              }}
+-              value={activeBrainId ?? ""}
+-              disabled={vaultSwitchBusy}
+-              onChange={(event) => {
+-                void handleActiveVaultChange(event.target.value);
+-              }}
+-            >
+-              {brains.length === 0 && <option value="">No vault configured</option>}
+-              {brains.map((brain) => <option key={brain.id} value={brain.id}>{brain.name || brain.id}</option>)}
+-            </select>
++            {/* The real vault picker, not a native <select>.
++                A native option list is drawn by the OS from `color-scheme`,
++                which the theme sets on :root from the app appearance — but the
++                sidebar is dark in EVERY theme, so under a light appearance the
++                OS painted a white list while the options inherited near-white
++                nav text: unreadable, and no appearance setting could fix it.
++                This picker draws its own list, so it is always legible, and it
++                brings sort + list/grid with it — which matters at 30+ vaults. */}
++            <div className="mt-1.5">
++              <BrainSelector
++                placement="up"
++                mode="switch"
++                tone="nav"
++                onSwitch={handleActiveVaultChange}
++                disabled={vaultSwitchBusy}
++              />
++            </div>
+             {switchingBrainId !== null ? (
+               <p className="mt-1.5 truncate text-[10px]" style={{ color: "var(--nv-accent)" }} role="status" aria-live="polite">
+                 Switching to {switchingBrain?.name || "vault"}…
+-- 
+2.53.0.windows.2
+
