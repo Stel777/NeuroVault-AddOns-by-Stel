@@ -1,7 +1,7 @@
 From 99c3b80ade66734764f44b3db67ecffb5d13c5d4 Mon Sep 17 00:00:00 2001
 From: Stel777 <274792865+Stel777@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 20:14:01 +0300
-Subject: [PATCH 5/5] feat(nav): put the real vault picker in the sidebar, with
+Subject: [PATCH 5/6] feat(nav): put the real vault picker in the sidebar, with
  list/grid
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

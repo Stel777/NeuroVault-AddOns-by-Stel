@@ -1,0 +1,83 @@
+From ad5fb3a85510b492bad448aecc132fae39599daf Mon Sep 17 00:00:00 2001
+From: Stel777 <274792865+Stel777@users.noreply.github.com>
+Date: Sun, 26 Jul 2026 00:30:18 +0300
+Subject: [PATCH 6/6] fix(vaults): stop the grid toggle being clipped out of
+ the panel header
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The header packed three controls into a 260px panel that clips its overflow,
+and the sort label was whitespace-nowrap — so "Recently changed" held its full
+width and pushed the list/grid toggle past the panel edge, where overflow-hidden
+silently ate it. The toggle shipped but could not be seen or clicked.
+
+Make the sort label the only thing that gives: it truncates inside a min-w-0
+flex child, while the vault count and the toggle are flex-shrink-0. The toggle
+is now reachable at any panel width.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/components/BrainSelector.tsx | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/src/components/BrainSelector.tsx b/src/components/BrainSelector.tsx
+index b899172..80c8bbb 100644
+--- a/src/components/BrainSelector.tsx
++++ b/src/components/BrainSelector.tsx
+@@ -279,21 +279,25 @@ export function BrainSelector({
+             ...(isGrid ? { width: "min(76vw, 760px)" } : {}),
+           }}
+         >
+-          {/* Header — vault count + sort control */}
++          {/* Header — vault count + sort control + view toggle.
++              Three controls in a 260px panel that clips its overflow, so the
++              only flexible one is the sort label: it truncates, and the count
++              and the view toggle never shrink. Otherwise the toggle is the one
++              pushed out of the panel and silently clipped. */}
+           <div
+-            className="flex items-center justify-between px-3 py-1.5"
++            className="flex items-center gap-1.5 px-3 py-1.5"
+             style={{ borderBottom: "1px solid var(--nv-border)" }}
+           >
+             <span
+-              className="text-[10px] font-[Geist,sans-serif] uppercase tracking-wider"
++              className="text-[10px] font-[Geist,sans-serif] uppercase tracking-wider flex-shrink-0"
+               style={{ color: "var(--nv-text-dim)" }}
+             >
+               {brains.length} {brains.length === 1 ? "vault" : "vaults"}
+             </span>
+-            <div className="relative">
++            <div className="relative min-w-0 flex-1 flex justify-end">
+               <button
+                 onClick={() => setSortMenuOpen((s) => !s)}
+-                className="flex items-center gap-1 h-6 px-1.5 rounded-md transition-colors"
++                className="flex items-center gap-1 h-6 px-1.5 rounded-md transition-colors min-w-0 max-w-full"
+                 style={{
+                   color: "var(--nv-text-dim)",
+                   background: sortMenuOpen ? "var(--nv-surface)" : "transparent",
+@@ -303,10 +307,10 @@ export function BrainSelector({
+                 aria-haspopup="menu"
+                 aria-expanded={sortMenuOpen}
+               >
+-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
++                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                   <path strokeLinecap="round" strokeLinejoin="round" d="M3 7h12M3 12h8M3 17h5M17 5v14m0 0l-3-3m3 3l3-3" />
+                 </svg>
+-                <span className="text-[10px] font-[Geist,sans-serif] whitespace-nowrap">
++                <span className="text-[10px] font-[Geist,sans-serif] truncate">
+                   {SORT_OPTIONS.find((o) => o.key === sortKey)?.label}
+                 </span>
+               </button>
+@@ -341,7 +345,7 @@ export function BrainSelector({
+             </div>
+             {/* List / grid toggle — grid is the browsable view when there are
+                 dozens of vaults. Applies to whatever sort is selected. */}
+-            <div className="flex items-center gap-0.5 rounded-md p-0.5" style={{ background: "var(--nv-surface)" }}>
++            <div className="flex items-center gap-0.5 rounded-md p-0.5 flex-shrink-0" style={{ background: "var(--nv-surface)" }}>
+               <button
+                 onClick={() => setViewMode("list")}
+                 className="w-6 h-6 rounded flex items-center justify-center transition-colors"
+-- 
+2.53.0.windows.2
+
